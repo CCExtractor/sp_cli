@@ -540,3 +540,145 @@ class ApiContractTests(unittest.TestCase):
         result = self.runner.invoke(cli, ['queue', '--status', 'queued', '--limit', '10'])
         self.assertEqual(result.exit_code, 0)
         mock_get.assert_called_once_with('/system/queue', params={'status': 'queued', 'limit': 10})
+
+
+class ErrorsLogsArtifactsTests(unittest.TestCase):
+    """Cover the endpoints unblocked by sample-platform#1135 and #1141.
+
+    These commands shipped as stubs while their PRs were open; the assertions
+    here pin them to the contracts that actually landed.
+    """
+
+    def setUp(self):
+        """Create a runner for each test."""
+        self.runner = CliRunner()
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_run_errors_forwards_every_declared_filter(self, mock_get):
+        """`run errors` supports the type, severity, and sample_id filters the route applies."""
+        mock_get.return_value = {'data': [], 'pagination': {}}
+        result = self.runner.invoke(cli, [
+            'run', 'errors', '9299', '--type', 'missing_output',
+            '--severity', 'error', '--sample', '42', '--limit', '10'])
+
+        self.assertEqual(result.exit_code, 0)
+        mock_get.assert_called_once_with('/runs/9299/errors', params={
+            'type': 'missing_output', 'severity': 'error', 'sample_id': 42, 'limit': 10})
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_run_errors_rejects_types_the_service_cannot_emit(self, mock_get):
+        """derive_errors_for_run only produces three types; 'test_failure' is not one."""
+        for bad_type in ('test_failure', 'segfault', 'timeout'):
+            result = self.runner.invoke(cli, ['run', 'errors', '9299', '--type', bad_type])
+            self.assertNotEqual(result.exit_code, 0, f'{bad_type} should be rejected')
+        mock_get.assert_not_called()
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_error_summary_group_by_is_a_closed_set(self, mock_get):
+        """group_by outside the API's four keys is a 400, so reject it locally."""
+        self.assertNotEqual(
+            self.runner.invoke(cli, ['run', 'error-summary', '9299', '--group-by', 'run']).exit_code, 0)
+        mock_get.assert_not_called()
+
+        mock_get.return_value = {'data': [], 'pagination': {}}
+        result = self.runner.invoke(cli, ['run', 'error-summary', '9299', '--group-by', 'regression_id'])
+        self.assertEqual(result.exit_code, 0)
+        mock_get.assert_called_once_with('/runs/9299/error-summary',
+                                         params={'group_by': 'regression_id'})
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_infra_errors_target_the_hyphenated_path_and_gate_stacks(self, mock_get):
+        """The route is /infrastructure-errors, and include_stack is opt-in as a string."""
+        mock_get.return_value = {'data': [], 'pagination': {}}
+        result = self.runner.invoke(cli, ['run', 'infra-errors', '9299', '--type', 'vm_provisioning'])
+        self.assertEqual(result.exit_code, 0)
+        mock_get.assert_called_once_with('/runs/9299/infrastructure-errors',
+                                         params={'type': 'vm_provisioning'})
+
+        mock_get.reset_mock()
+        result = self.runner.invoke(cli, ['run', 'infra-errors', '9299', '--include-stack'])
+        self.assertEqual(result.exit_code, 0)
+        mock_get.assert_called_once_with('/runs/9299/infrastructure-errors',
+                                         params={'include_stack': 'true'})
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_infra_error_type_is_restricted_to_the_classifier_buckets(self, mock_get):
+        """_classify_infra_error only ever returns six values."""
+        result = self.runner.invoke(cli, ['run', 'infra-errors', '9299', '--type', 'network'])
+        self.assertNotEqual(result.exit_code, 0)
+        mock_get.assert_not_called()
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_run_artifacts_filters_by_type(self, mock_get):
+        """`run artifacts --type` mirrors the artifact kinds list_artifacts builds."""
+        mock_get.return_value = {'data': [], 'pagination': {}}
+        result = self.runner.invoke(cli, ['run', 'artifacts', '9299', '--type', 'coredump'])
+
+        self.assertEqual(result.exit_code, 0)
+        mock_get.assert_called_once_with('/runs/9299/artifacts', params={'type': 'coredump'})
+
+        self.assertNotEqual(
+            self.runner.invoke(cli, ['run', 'artifacts', '9299', '--type', 'stderr']).exit_code, 0)
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_run_logs_use_cursor_pagination_never_offset(self, mock_get):
+        """The logs route 400s if offset is present, so the CLI exposes --cursor only."""
+        mock_get.return_value = {'data': [], 'pagination': {'limit': 100, 'next_cursor': None}}
+        result = self.runner.invoke(cli, [
+            'run', 'logs', '9299', '--level', 'error', '--source', 'worker',
+            '--contains', 'segfault', '--limit', '50', '--cursor', '400'])
+
+        self.assertEqual(result.exit_code, 0)
+        mock_get.assert_called_once_with('/runs/9299/logs', params={
+            'level': 'error', 'source': 'worker', 'contains': 'segfault',
+            'limit': 50, 'cursor': '400'})
+
+        self.assertNotEqual(
+            self.runner.invoke(cli, ['run', 'logs', '9299', '--offset', '10']).exit_code, 0)
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_run_logs_rejects_an_over_long_contains_before_the_request(self, mock_get):
+        """The API caps contains at 100 characters; fail locally instead of round-tripping."""
+        result = self.runner.invoke(cli, ['run', 'logs', '9299', '--contains', 'x' * 101])
+
+        self.assertNotEqual(result.exit_code, 0)
+        mock_get.assert_not_called()
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_run_logs_all_follows_the_cursor_to_the_end(self, mock_get):
+        """--all pages through next_cursor and collapses the result into one list."""
+        mock_get.side_effect = [
+            {'data': [{'message': 'first'}], 'pagination': {'next_cursor': '1'}},
+            {'data': [{'message': 'second'}], 'pagination': {'next_cursor': None}},
+        ]
+        result = self.runner.invoke(cli, ['run', 'logs', '9299', '--all'])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(mock_get.call_args_list, [
+            mock.call('/runs/9299/logs', params={}),
+            mock.call('/runs/9299/logs', params={'cursor': '1'}),
+        ])
+        payload = json.loads(result.output)
+        self.assertEqual([line['message'] for line in payload['data']], ['first', 'second'])
+        self.assertEqual(payload['summary']['lines'], 2)
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_run_logs_all_and_cursor_are_mutually_exclusive(self, mock_get):
+        """--all restarts from the top, so combining it with --cursor is a usage error."""
+        result = self.runner.invoke(cli, ['run', 'logs', '9299', '--all', '--cursor', '40'])
+
+        self.assertNotEqual(result.exit_code, 0)
+        mock_get.assert_not_called()
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_missing_log_file_is_distinguishable_from_a_missing_run(self, mock_get):
+        """A cold-storage log 404s as log_not_found, which the envelope must preserve."""
+        mock_get.side_effect = ApiError(
+            'log_not_found', 'Log file for run 9299 is not available locally.', 404,
+            {'run_id': 9299, 'action_required': 'Use GET /runs/9299/artifacts (type=build_log)'})
+        result = self.runner.invoke(cli, ['run', 'logs', '9299'])
+
+        self.assertEqual(result.exit_code, 4)
+        envelope = json.loads(result.stderr)
+        self.assertEqual(envelope['error']['code'], 'log_not_found')
+        self.assertIn('artifacts', envelope['error']['details']['action_required'])

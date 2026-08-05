@@ -74,6 +74,8 @@ def _footer(payload: Dict[str, Any]) -> str:
             parts.append(f"{pagination['total']} total")
         if pagination.get('next_offset') is not None:
             parts.append(f"more at offset {pagination['next_offset']}")
+        if pagination.get('next_cursor') is not None:
+            parts.append(f"more at cursor {pagination['next_cursor']}")
         return ' · '.join(parts)
     return ''
 

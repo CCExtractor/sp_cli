@@ -5,8 +5,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import click
 
 from sp_cli.client import ApiError
-from sp_cli.constants import (CANCEL_REASON_MIN_LENGTH, PLATFORMS,
-                              RUN_STATUSES, SAMPLE_STATUSES)
+from sp_cli.constants import (ARTIFACT_TYPES, CANCEL_REASON_MIN_LENGTH,
+                              ERROR_GROUP_BY, ERROR_SEVERITIES, ERROR_TYPES,
+                              INFRA_ERROR_TYPES, LOG_CONTAINS_MAX_LENGTH,
+                              LOG_LEVELS, LOG_MAX_LIMIT, LOG_SOURCES,
+                              PLATFORMS, RUN_STATUSES, SAMPLE_STATUSES)
 from sp_cli.output import render, render_error
 from sp_cli.runner import clean_params, fetch_and_render
 from sp_cli.triage import classify_sample, is_failure
@@ -277,28 +280,153 @@ def run_output(ctx: click.Context, run_id: int, sample_id: int, regression_id: O
 
 @run.command('artifacts')
 @click.argument('run_id', type=int)
+@click.option('--type', 'artifact_type', type=click.Choice(ARTIFACT_TYPES), default=None,
+              help='Filter by artifact type.')
+@click.option('--limit', type=int, default=None, help='Page size (max 100).')
+@click.option('--offset', type=int, default=None, help='Pagination offset.')
 @click.pass_context
-def run_artifacts(ctx: click.Context, run_id: int) -> None:
-    """List downloadable artifacts for a run (signed URLs)."""
-    fetch_and_render(ctx, f'/runs/{run_id}/artifacts')
+def run_artifacts(ctx: click.Context, run_id: int, artifact_type: Optional[str],
+                  limit: Optional[int], offset: Optional[int]) -> None:
+    """List downloadable artifacts for a run.
+
+    Covers the build binary, any coredump, combined stdout, the build log, and
+    every expected/actual output file. `storage_status` says whether the blob is
+    actually retrievable; `download_url` is null for the build log, which is read
+    through `sp run logs` instead of downloaded.
+    """
+    params = clean_params({'type': artifact_type, 'limit': limit, 'offset': offset})
+    fetch_and_render(ctx, f'/runs/{run_id}/artifacts', params)
 
 
 @run.command('logs')
 @click.argument('run_id', type=int)
+@click.option('--level', type=click.Choice(LOG_LEVELS), default=None,
+              help='Keep lines at this level. Levels are scanned out of the raw text.')
+@click.option('--source', type=click.Choice(LOG_SOURCES), default=None,
+              help='Keep lines from this component.')
+@click.option('--contains', default=None,
+              help=f'Case-insensitive substring filter (max {LOG_CONTAINS_MAX_LENGTH} chars).')
+@click.option('--limit', type=int, default=None,
+              help=f'Lines per page (max {LOG_MAX_LIMIT}, default 100).')
+@click.option('--cursor', default=None, help='Resume from a previous response\'s next_cursor.')
+@click.option('--all', 'fetch_all', is_flag=True, default=False,
+              help='Follow next_cursor and return the whole log at once.')
 @click.pass_context
-def run_logs(ctx: click.Context, run_id: int) -> None:
-    """Show raw logs for a run (requires contributor or admin privileges)."""
-    fetch_and_render(ctx, f'/runs/{run_id}/logs')
+def run_logs(ctx: click.Context, run_id: int, level: Optional[str], source: Optional[str],
+             contains: Optional[str], limit: Optional[int], cursor: Optional[str],
+             fetch_all: bool) -> None:
+    """Read a run's build log (requires the system:read scope).
+
+    This endpoint is cursor-paginated, not offset-paginated: page forward with
+    --cursor using the next_cursor from the previous response, or pass --all to
+    follow it to the end. Sending an offset is a 400.
+
+    A 404 with code `log_not_found` means the log is no longer on the VM's disk
+    rather than that the run is missing -- fetch it from `sp run artifacts
+    --type build_log` in that case.
+
+    The level and source of each line are recovered by scanning the raw text, so
+    they are best-effort: an unrecognized line reports level=info, source=web.
+    """
+    if contains is not None and len(contains) > LOG_CONTAINS_MAX_LENGTH:
+        raise click.BadParameter(
+            f'must be {LOG_CONTAINS_MAX_LENGTH} characters or less', param_hint='--contains')
+    if fetch_all and cursor is not None:
+        raise click.BadParameter('--all starts from the beginning; drop --cursor',
+                                 param_hint='--cursor')
+
+    params = clean_params({'level': level, 'source': source, 'contains': contains,
+                           'limit': limit, 'cursor': cursor})
+    if not fetch_all:
+        fetch_and_render(ctx, f'/runs/{run_id}/logs', params)
+        return
+
+    client = ctx.obj['client']
+    output = ctx.obj['output']
+    try:
+        lines = client.get_cursor_paginated(f'/runs/{run_id}/logs', params)
+    except ApiError as error:
+        render_error(error, output)
+        raise SystemExit(error.exit_code)
+    render({'data': lines, 'summary': {'lines': len(lines)}}, output)
 
 
 @run.command('errors')
 @click.argument('run_id', type=int)
-@click.option('--type', 'error_type', default=None,
-              help='test_failure|exit_code_mismatch|missing_output|diff_mismatch')
+@click.option('--type', 'error_type', type=click.Choice(ERROR_TYPES), default=None,
+              help='Filter by error type.')
+@click.option('--severity', type=click.Choice(ERROR_SEVERITIES), default=None,
+              help='Filter by severity. Test errors are only error or warning.')
+@click.option('--sample', 'sample_id', type=int, default=None,
+              help='Restrict to one media sample id.')
+@click.option('--limit', type=int, default=None, help='Page size (max 100).')
+@click.option('--offset', type=int, default=None, help='Pagination offset.')
 @click.pass_context
-def run_errors(ctx: click.Context, run_id: int, error_type: Optional[str]) -> None:
-    """Show structured test errors for a run."""
-    fetch_and_render(ctx, f'/runs/{run_id}/errors', clean_params({'type': error_type}))
+def run_errors(ctx: click.Context, run_id: int, error_type: Optional[str],
+               severity: Optional[str], sample_id: Optional[int],
+               limit: Optional[int], offset: Optional[int]) -> None:
+    """Show structured test errors for a run.
+
+    These are derived from the result rows at request time rather than stored,
+    so they line up with `sp run failures` but carry per-output detail. For
+    failures of the infrastructure itself, see `sp run infra-errors`.
+    """
+    params = clean_params({'type': error_type, 'severity': severity, 'sample_id': sample_id,
+                           'limit': limit, 'offset': offset})
+    fetch_and_render(ctx, f'/runs/{run_id}/errors', params)
+
+
+@run.command('error-summary')
+@click.argument('run_id', type=int)
+@click.option('--group-by', 'group_by', type=click.Choice(ERROR_GROUP_BY), default=None,
+              help='Bucket key. The API defaults to type.')
+@click.option('--severity', type=click.Choice(ERROR_SEVERITIES), default=None,
+              help='Keep only buckets at this severity.')
+@click.option('--limit', type=int, default=None, help='Page size (max 100).')
+@click.option('--offset', type=int, default=None, help='Pagination offset.')
+@click.pass_context
+def run_error_summary(ctx: click.Context, run_id: int, group_by: Optional[str],
+                      severity: Optional[str], limit: Optional[int],
+                      offset: Optional[int]) -> None:
+    """Show grouped error counts for a run.
+
+    The cheapest first look at a broken run: one row per bucket with a count,
+    so an agent can decide what to drill into before pulling every error.
+    Each bucket's severity is the highest of the errors within it.
+    """
+    params = clean_params({'group_by': group_by, 'severity': severity,
+                           'limit': limit, 'offset': offset})
+    fetch_and_render(ctx, f'/runs/{run_id}/error-summary', params)
+
+
+@run.command('infra-errors')
+@click.argument('run_id', type=int)
+@click.option('--type', 'error_type', type=click.Choice(INFRA_ERROR_TYPES), default=None,
+              help='Filter by infrastructure failure stage.')
+@click.option('--severity', type=click.Choice(ERROR_SEVERITIES), default=None,
+              help='Filter by severity. These are always reported as critical.')
+@click.option('--include-stack', is_flag=True, default=False,
+              help='Include stack traces (admin or contributor only; 403 otherwise).')
+@click.option('--limit', type=int, default=None, help='Page size (max 100).')
+@click.option('--offset', type=int, default=None, help='Pagination offset.')
+@click.pass_context
+def run_infra_errors(ctx: click.Context, run_id: int, error_type: Optional[str],
+                     severity: Optional[str], include_stack: bool,
+                     limit: Optional[int], offset: Optional[int]) -> None:
+    """Show infrastructure errors for a run (requires the system:read scope).
+
+    These are VM, checkout, build, worker, and storage failures, classified from
+    TestProgress messages by keyword -- so the type is a best-effort guess, not a
+    recorded field. A run that fails here usually has no test errors at all.
+
+    Stack traces are withheld by default because they carry internal paths;
+    --include-stack needs the admin or contributor role and 403s without it.
+    """
+    params = clean_params({'type': error_type, 'severity': severity,
+                           'limit': limit, 'offset': offset})
+    if include_stack:
+        params['include_stack'] = 'true'
+    fetch_and_render(ctx, f'/runs/{run_id}/infrastructure-errors', params)
 
 
 def _resolve_diff_targets(client: Any, run_id: int, sample_id: int,

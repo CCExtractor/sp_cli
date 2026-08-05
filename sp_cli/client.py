@@ -166,3 +166,38 @@ class ApiClient:
                 break
             offset = next_offset
         return items
+
+    def get_cursor_paginated(self, path: str, params: Optional[Dict[str, Any]] = None,
+                             max_items: int = 5000) -> List[Any]:
+        """
+        Follow cursor pagination and return the combined ``data`` list.
+
+        Distinct from :meth:`get_paginated` because the API refuses to mix the
+        two schemes: sending ``offset`` to a cursor-paginated endpoint is a 400.
+        The cursor is opaque here -- it is echoed back exactly as received.
+
+        :param path: API path below ``/api/v1``.
+        :type path: str
+        :param params: Optional query-string parameters (``cursor`` is managed).
+        :type params: Optional[Dict[str, Any]]
+        :param max_items: Safety cap on total items collected.
+        :type max_items: int
+        :return: All items across pages.
+        :rtype: List[Any]
+        """
+        base = dict(params or {})
+        cursor = base.pop('cursor', None)
+        items: List[Any] = []
+        while True:
+            # A fresh mapping per page: reusing one would alias into every call.
+            page_params = dict(base)
+            if cursor is not None:
+                page_params['cursor'] = cursor
+            payload = self.get(path, params=page_params)
+            data = payload.get('data', []) if isinstance(payload, dict) else []
+            items.extend(data)
+            pagination = payload.get('pagination', {}) if isinstance(payload, dict) else {}
+            cursor = pagination.get('next_cursor')
+            if not data or cursor is None or len(items) >= max_items:
+                break
+        return items
