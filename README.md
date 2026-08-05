@@ -54,6 +54,14 @@ sp run logs <run_id> --level error   # build log, cursor-paginated
 sp run artifacts <run_id>            # binary, coredump, outputs, build log
 ```
 
+To get the actual output file rather than the JSON envelope it arrives in:
+
+```bash
+sp run output <run_id> <id> --decode > actual.srt
+sp run output <run_id> <id> --side expected --decode > expected.srt
+diff expected.srt actual.srt
+```
+
 ### Running and browsing
 
 ```bash
@@ -105,6 +113,17 @@ agent gets a straight answer about *why* a test failed, without reading logs.
 
 With `--with-history`, each failure also gets a verdict across previous runs:
 `NEW_REGRESSION`, `STILL_FAILING`, `NEVER_PASSED`, `FLAKY`, `NO_HISTORY`.
+
+### Reliability
+
+Failed `GET`s are retried with exponential backoff — connection failures, read
+timeouts, `429`, and `5xx`. This matters most for `investigate --with-history`,
+which makes one call per failing sample: without it a single blip partway
+through discards every lookup before it. Retry notices go to stderr, so JSON on
+stdout stays clean. Tune with `--retries N`; `--retries 0` fails fast.
+
+Writes are never retried. `POST /runs` is not idempotent, and a retry that
+raced a slow-but-successful first attempt would queue the run twice.
 
 ### Exit codes
 

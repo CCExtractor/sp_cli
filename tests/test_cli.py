@@ -940,3 +940,70 @@ class ScopeContractTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(len(mock_request.call_args.kwargs['json_body']['scopes']),
                          len(TOKEN_SCOPES))
+
+
+class OutputDecodeTests(unittest.TestCase):
+    """`run output --decode` writes the file itself, not the JSON envelope.
+
+    The API returns subtitle files base64-encoded inside JSON. Without --decode
+    the terminal gets a multi-kilobyte blob that no one can read and no diff
+    tool can consume.
+    """
+
+    def setUp(self):
+        """Create a runner for each test."""
+        self.runner = CliRunner()
+
+    #: What /runs/{id}/samples/{id} answers, so the ids can be resolved.
+    DETAIL = {'sample_id': 11, 'regression_test_id': 11,
+              'outputs': [{'output_id': 11, 'status': 'fail'}]}
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_decode_writes_the_raw_file(self, mock_get):
+        """The base64 payload comes back out as the original bytes."""
+        import base64
+        body = '1\r\n00:00:01,000 --> 00:00:02,000\r\nHELLO\r\n'
+        mock_get.side_effect = [
+            self.DETAIL,
+            {'content': base64.b64encode(body.encode()).decode(), 'encoding': 'base64'},
+        ]
+        result = self.runner.invoke(cli, ['run', 'output', '9388', '11', '--decode'])
+
+        self.assertEqual(result.exit_code, 0)
+        # Asserted on bytes: CRLF is what a subtitle file actually contains, and
+        # result.stdout would normalise it away and hide a re-encoding bug.
+        self.assertEqual(result.stdout_bytes, body.encode())
+        # No JSON envelope leaked alongside the file.
+        self.assertNotIn(b'"encoding"', result.stdout_bytes)
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_plain_content_is_passed_through(self, mock_get):
+        """An envelope that is not base64 is written as-is."""
+        mock_get.side_effect = [self.DETAIL, {'content': 'already text', 'encoding': None}]
+        result = self.runner.invoke(cli, ['run', 'output', '9388', '11', '--decode'])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.stdout, 'already text')
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_without_the_flag_the_envelope_is_unchanged(self, mock_get):
+        """The default stays JSON, so existing scripts are unaffected."""
+        mock_get.side_effect = [self.DETAIL, {'content': 'eA==', 'encoding': 'base64'}]
+        result = self.runner.invoke(cli, ['run', 'output', '9388', '11'])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(json.loads(result.stdout)['encoding'], 'base64')
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_an_envelope_with_no_inline_content_is_an_error(self, mock_get):
+        """A download-only artifact has nothing to decode; say so, don't crash."""
+        mock_get.side_effect = [
+            self.DETAIL,
+            {'content': None, 'download_url': 'https://storage.example/x'},
+        ]
+        result = self.runner.invoke(cli, ['run', 'output', '9388', '11', '--decode'])
+
+        self.assertEqual(result.exit_code, 4)
+        envelope = json.loads(result.stderr)
+        self.assertEqual(envelope['error']['code'], 'no_content')
+        self.assertIn('download_url', envelope['error']['details'])

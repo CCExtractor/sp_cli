@@ -27,12 +27,14 @@ DEFAULT_BASE_URL = 'http://localhost:5000/api/v1'
 @click.option('--output', '-o', type=click.Choice(['json', 'table']), default='json', show_default=True,
               help='Output format.')
 @click.option('--timeout', type=int, default=30, show_default=True, help='Per-request timeout (seconds).')
+@click.option('--retries', type=int, default=2, show_default=True,
+              help='Extra attempts for a failed GET (timeouts, 429, 5xx). 0 disables retrying.')
 @click.option('--no-color', is_flag=True, default=False,
               help='Never colorize table output. Also honours the NO_COLOR environment variable.')
 @click.version_option(__version__, prog_name='sp')
 @click.pass_context
 def cli(ctx: click.Context, base_url: str, token: Optional[str], output: str,
-        timeout: int, no_color: bool) -> None:
+        timeout: int, retries: int, no_color: bool) -> None:
     """AI-friendly CLI for the CCExtractor CI / Sample Platform.
 
     Emits JSON by default so it can be driven by agents and scripts. Point it at
@@ -48,7 +50,7 @@ def cli(ctx: click.Context, base_url: str, token: Optional[str], output: str,
                        'run chmod 600 on it.', err=True)
 
     ctx.obj = {
-        'client': ApiClient(base_url, token=token, timeout=timeout),
+        'client': ApiClient(base_url, token=token, timeout=timeout, retries=retries),
         'output': output,
         'base_url': base_url,
         'color': output == 'table' and not no_color,

@@ -1,8 +1,28 @@
 """HTTP client for the CCExtractor CI System API (`/api/v1`)."""
 
+import random
+import sys
+import time
 from typing import Any, Dict, List, Optional
 
 import requests  # type: ignore[import-untyped]
+
+#: Statuses where the server said "not now" rather than "no". Retrying these is
+#: the difference between riding out a blip and losing a whole investigation:
+#: ``investigate --with-history`` makes one call per failing sample, so a single
+#: timeout 40 lookups in would otherwise throw away everything before it.
+_RETRY_STATUSES = frozenset({429, 502, 503, 504})
+
+#: Only GET is retried. POST /runs is not idempotent -- a retry that raced a
+#: slow-but-successful first attempt would queue the run twice -- and a repeated
+#: DELETE turns a success into a confusing 404.
+_RETRYABLE_METHODS = frozenset({'GET'})
+
+#: Base for exponential backoff, in seconds: 0.5, 1.0, 2.0 ...
+_BACKOFF_BASE = 0.5
+
+#: Ceiling on a single sleep, so a large Retry-After cannot hang the CLI.
+_BACKOFF_MAX = 30.0
 
 
 class ApiError(Exception):
@@ -57,7 +77,8 @@ class ApiError(Exception):
 class ApiClient:
     """Minimal client over the JSON API. Sends a bearer token when configured."""
 
-    def __init__(self, base_url: str, token: Optional[str] = None, timeout: int = 30) -> None:
+    def __init__(self, base_url: str, token: Optional[str] = None, timeout: int = 30,
+                 retries: int = 2) -> None:
         """
         Configure the client.
 
@@ -67,10 +88,13 @@ class ApiClient:
         :type token: Optional[str]
         :param timeout: Per-request timeout in seconds.
         :type timeout: int
+        :param retries: Extra attempts for a failed GET. 0 disables retrying.
+        :type retries: int
         """
         self.base_url = base_url.rstrip('/')
         self.token = token
         self.timeout = timeout
+        self.retries = max(0, retries)
         self.session = requests.Session()
 
     def _headers(self) -> Dict[str, str]:
@@ -103,11 +127,25 @@ class ApiClient:
         :rtype: Any
         """
         url = f"{self.base_url}{path}"
-        try:
-            response = self.session.request(method, url, params=params, json=json_body,
-                                            headers=self._headers(), timeout=self.timeout)
-        except requests.RequestException as exc:
-            raise ApiError('connection_error', f'Could not reach {url}: {exc}')
+        attempts = 1
+        if method.upper() in _RETRYABLE_METHODS:
+            attempts += self.retries
+
+        for attempt in range(1, attempts + 1):
+            last = attempt == attempts
+            try:
+                response = self.session.request(method, url, params=params, json=json_body,
+                                                headers=self._headers(), timeout=self.timeout)
+            except requests.RequestException as exc:
+                if last:
+                    raise ApiError('connection_error', f'Could not reach {url}: {exc}')
+                self._wait(attempt, None, f'{type(exc).__name__} on {method} {path}')
+                continue
+
+            if response.status_code in _RETRY_STATUSES and not last:
+                self._wait(attempt, response, f'HTTP {response.status_code} on {method} {path}')
+                continue
+            break
 
         if response.status_code == 204:
             return None
@@ -128,6 +166,39 @@ class ApiClient:
             )
 
         return payload
+
+    def _wait(self, attempt: int, response: Optional[Any], reason: str) -> None:
+        """
+        Sleep before the next attempt, and say so on stderr.
+
+        Backoff is exponential with jitter, so a fleet of agents retrying the
+        same blip does not resynchronise into a second thundering herd. A
+        ``Retry-After`` header wins over the computed delay, because the server
+        knows better than we do -- but it is still clamped, so a header of 3600
+        cannot silently hang the CLI for an hour.
+
+        :param attempt: Which attempt just failed, counting from 1.
+        :type attempt: int
+        :param response: The failed response, when there was one.
+        :type response: Optional[Any]
+        :param reason: Short description of what failed, for the notice.
+        :type reason: str
+        """
+        delay = min(_BACKOFF_BASE * (2 ** (attempt - 1)), _BACKOFF_MAX)
+        delay += random.uniform(0, delay / 2)
+
+        if response is not None:
+            headers = getattr(response, 'headers', None) or {}
+            header = headers.get('Retry-After')
+            if header:
+                try:
+                    delay = min(float(header), _BACKOFF_MAX)
+                except (TypeError, ValueError):
+                    pass  # A date-format Retry-After; the computed backoff stands.
+
+        # stderr, so a retry notice can never contaminate JSON on stdout.
+        print(f'{reason}; retrying in {delay:.1f}s', file=sys.stderr)
+        time.sleep(delay)
 
     def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         """

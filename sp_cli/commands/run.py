@@ -1,5 +1,7 @@
 """``sp run`` — list, inspect, and triage CI runs."""
 
+import base64
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 import click
@@ -292,13 +294,21 @@ def run_cancel(ctx: click.Context, run_id: int, reason: Optional[str]) -> None:
 @click.option('--side', type=click.Choice(('expected', 'actual')), default='actual',
               show_default=True, help='Which side of the comparison to fetch.')
 @click.option('--format', 'fmt', default=None, help='Response format accepted by the API.')
+@click.option('--decode', is_flag=True, default=False,
+              help='Write the decoded file to stdout instead of the JSON envelope.')
 @click.pass_context
 def run_output(ctx: click.Context, run_id: int, sample_id: int, regression_id: Optional[int],
-               output_id: Optional[int], side: str, fmt: Optional[str]) -> None:
+               output_id: Optional[int], side: str, fmt: Optional[str], decode: bool) -> None:
     """Fetch one side of a result's output file.
 
     Resolves the (media sample, regression, output) ids the same way `sp run
     diff` does, so the hidden ids the web UI needs are not required here.
+
+    The API returns the file base64-encoded inside a JSON envelope. --decode
+    writes the decoded bytes straight to stdout instead, so the subtitle file
+    can be read or redirected:
+
+        sp run output 9388 11 --decode > actual.srt
 
     Note: for an output that matched, the API answers ``actual`` with a 303
     redirect to ``expected`` -- requests follows it, so the expected content is
@@ -315,10 +325,46 @@ def run_output(ctx: click.Context, run_id: int, sample_id: int, regression_id: O
             f'/runs/{run_id}/samples/{media_sample_id}'
             f'/regression-tests/{reg_id}/outputs/{out_id}/{side}',
             params=clean_params({'format': fmt}))
+        if decode:
+            _write_decoded(payload)
+            return
     except ApiError as error:
         render_error(error, output)
         raise SystemExit(error.exit_code)
     render(payload, output)
+
+
+def _write_decoded(payload: Any) -> None:
+    """
+    Write an output envelope's file content to stdout as raw bytes.
+
+    Written to the binary buffer rather than echoed, so the file survives
+    byte-for-byte: these are subtitle files that may carry CRLF line endings
+    and a non-UTF-8 encoding, and re-encoding them would corrupt a diff.
+
+    :param payload: The decoded output envelope from the API.
+    :type payload: Any
+    :raises ApiError: when the envelope carries no inline content.
+    """
+    content = payload.get('content') if isinstance(payload, dict) else None
+    if content is None:
+        raise ApiError(
+            'no_content',
+            'This output has no inline content to decode; '
+            'fetch it from download_url instead.', 404,
+            {'download_url': payload.get('download_url') if isinstance(payload, dict) else None})
+
+    if (payload.get('encoding') or '').lower() == 'base64':
+        data = base64.b64decode(content)
+    else:
+        data = str(content).encode('utf-8')
+
+    stream = getattr(sys.stdout, 'buffer', None)
+    if stream is None:  # a text-only stream, e.g. under a test runner
+        sys.stdout.write(data.decode('utf-8', errors='replace'))
+    else:
+        stream.write(data)
+        stream.flush()
 
 
 @run.command('artifacts')
