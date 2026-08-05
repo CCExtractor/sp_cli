@@ -6,12 +6,14 @@ import click
 
 from sp_cli.client import ApiError
 from sp_cli.constants import (ARTIFACT_TYPES, CANCEL_REASON_MIN_LENGTH,
-                              ERROR_GROUP_BY, ERROR_SEVERITIES, ERROR_TYPES,
-                              INFRA_ERROR_TYPES, LOG_CONTAINS_MAX_LENGTH,
-                              LOG_LEVELS, LOG_MAX_LIMIT, LOG_SOURCES,
-                              PLATFORMS, RUN_STATUSES, SAMPLE_STATUSES)
+                              COMMIT_SHA_LENGTH, ERROR_GROUP_BY,
+                              ERROR_SEVERITIES, ERROR_TYPES, INFRA_ERROR_TYPES,
+                              LOG_CONTAINS_MAX_LENGTH, LOG_LEVELS,
+                              LOG_MAX_LIMIT, LOG_SOURCES,
+                              MAX_REGRESSION_TEST_IDS, PLATFORMS, RUN_STATUSES,
+                              SAMPLE_STATUSES)
 from sp_cli.output import render, render_error
-from sp_cli.runner import clean_params, fetch_and_render
+from sp_cli.runner import clean_params, fetch_and_render, send_and_render
 from sp_cli.triage import classify_sample, is_failure
 
 
@@ -50,6 +52,44 @@ def run_ls(ctx: click.Context, status: Optional[str], platform: Optional[str], b
                            'created_after': created_after, 'created_before': created_before,
                            'limit': limit, 'offset': offset})
     fetch_and_render(ctx, '/runs', params)
+
+
+@run.command('create')
+@click.option('--commit', 'commit_sha', required=True,
+              help=f'Full {COMMIT_SHA_LENGTH}-char commit SHA. Short SHAs are rejected.')
+@click.option('--platform', type=click.Choice(PLATFORMS), required=True, help='Test platform.')
+@click.option('--repository', required=True, help='Fork to test, as owner/repo.')
+@click.option('--branch', default=None,
+              help='Branch name. The API defaults to master when omitted.')
+@click.option('--pull-request', 'pull_request', type=int, default=None,
+              help='Associate the run with a pull request number.')
+@click.option('--test', 'regression_test_ids', type=int, multiple=True,
+              help=f'Restrict to these regression test ids (repeatable, max {MAX_REGRESSION_TEST_IDS}). '
+                   'Omit to run the full active suite.')
+@click.pass_context
+def run_create(ctx: click.Context, commit_sha: str, platform: str, repository: str,
+               branch: Optional[str], pull_request: Optional[int],
+               regression_test_ids: Tuple[int, ...]) -> None:
+    """Queue a new CI run.
+
+    The commit must already have a CI artifact built for that platform, so this
+    schedules a test of an existing build rather than triggering a compile.
+    """
+    if len(commit_sha) != COMMIT_SHA_LENGTH or not all(c in '0123456789abcdefABCDEF' for c in commit_sha):
+        raise click.BadParameter(
+            f'must be a {COMMIT_SHA_LENGTH}-character hex string', param_hint='--commit')
+    if '/' not in repository.strip('/') or repository.count('/') != 1:
+        raise click.BadParameter('must be in owner/repo format', param_hint='--repository')
+    if len(regression_test_ids) > MAX_REGRESSION_TEST_IDS:
+        raise click.BadParameter(
+            f'at most {MAX_REGRESSION_TEST_IDS} ids', param_hint='--test')
+
+    body = clean_params({
+        'commit_sha': commit_sha, 'platform': platform, 'repository': repository,
+        'branch': branch, 'pull_request': pull_request,
+        'regression_test_ids': list(regression_test_ids) or None,
+    })
+    send_and_render(ctx, 'POST', '/runs', body)
 
 
 @run.command('show')

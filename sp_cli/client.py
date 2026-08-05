@@ -33,7 +33,8 @@ class ApiError(Exception):
         """
         Map the error to a process exit code so callers can branch on it.
 
-        :return: 3 connection · 4 not-found · 5 validation · 6 auth · 7 rate-limited · 1 other.
+        :return: 3 connection · 4 not-found · 5 validation · 6 auth · 7 rate-limited ·
+                 8 conflict · 1 other.
         :rtype: int
         """
         if self.code == 'connection_error':
@@ -46,6 +47,10 @@ class ApiError(Exception):
             return 6
         if self.status == 429:
             return 7
+        # A refused delete (test/category still referenced) or a duplicate name.
+        # Distinct from validation: the body was fine, the world disagreed.
+        if self.status == 409:
+            return 8
         return 1
 
 
@@ -136,6 +141,43 @@ class ApiClient:
         :rtype: Any
         """
         return self.request('GET', path, params=params)
+
+    def post(self, path: str, json_body: Optional[Dict[str, Any]] = None) -> Any:
+        """
+        Perform a POST and return the decoded body.
+
+        :param path: API path below ``/api/v1``.
+        :type path: str
+        :param json_body: Optional JSON request body.
+        :type json_body: Optional[Dict[str, Any]]
+        :return: The decoded JSON body.
+        :rtype: Any
+        """
+        return self.request('POST', path, json_body=json_body)
+
+    def patch(self, path: str, json_body: Optional[Dict[str, Any]] = None) -> Any:
+        """
+        Perform a PATCH and return the decoded body.
+
+        :param path: API path below ``/api/v1``.
+        :type path: str
+        :param json_body: Optional JSON request body.
+        :type json_body: Optional[Dict[str, Any]]
+        :return: The decoded JSON body.
+        :rtype: Any
+        """
+        return self.request('PATCH', path, json_body=json_body)
+
+    def delete(self, path: str) -> Any:
+        """
+        Perform a DELETE and return the decoded body.
+
+        :param path: API path below ``/api/v1``.
+        :type path: str
+        :return: The decoded JSON body (or ``None`` for ``204``).
+        :rtype: Any
+        """
+        return self.request('DELETE', path)
 
     def get_paginated(self, path: str, params: Optional[Dict[str, Any]] = None,
                       max_items: int = 1000) -> List[Any]:

@@ -6,7 +6,9 @@ import click
 
 from sp_cli import __version__
 from sp_cli.client import ApiClient
+from sp_cli.commands.admin import admin
 from sp_cli.commands.auth import auth
+from sp_cli.commands.category import category
 from sp_cli.commands.investigate import investigate
 from sp_cli.commands.regression import regression
 from sp_cli.commands.run import run
@@ -46,6 +48,8 @@ cli.add_command(investigate)
 cli.add_command(run)
 cli.add_command(sample)
 cli.add_command(regression)
+cli.add_command(category)
 cli.add_command(auth)
+cli.add_command(admin)
 cli.add_command(health)
 cli.add_command(queue)

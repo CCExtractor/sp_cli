@@ -1,18 +1,19 @@
-"""``sp auth`` — obtain, list, and revoke API tokens."""
+"""``sp auth`` — obtain, list, and revoke API tokens, and manage users."""
 
 from typing import Optional, Tuple
 
 import click
 
 from sp_cli.client import ApiError
-from sp_cli.constants import TOKEN_MAX_DAYS, TOKEN_MIN_DAYS, TOKEN_SCOPES
+from sp_cli.constants import (TOKEN_MAX_DAYS, TOKEN_MIN_DAYS, TOKEN_SCOPES,
+                              USER_ROLES)
 from sp_cli.output import render, render_error
-from sp_cli.runner import clean_params, fetch_and_render
+from sp_cli.runner import clean_params, fetch_and_render, send_and_render
 
 
 @click.group()
 def auth() -> None:
-    """Obtain, list, and revoke API tokens."""
+    """Obtain, list, and revoke API tokens, and manage users."""
 
 
 @auth.command('login')
@@ -88,3 +89,40 @@ def auth_logout(ctx: click.Context) -> None:
         render_error(error, output)
         raise SystemExit(error.exit_code)
     click.echo('Token revoked.')
+
+
+@auth.command('whoami')
+@click.pass_context
+def auth_whoami(ctx: click.Context) -> None:
+    """Show the account and role the current token authenticates as.
+
+    The cheapest way to check that a token is live and carries the scopes a
+    command needs, without making a change.
+    """
+    fetch_and_render(ctx, '/auth/me')
+
+
+@auth.command('users')
+@click.option('--limit', type=int, default=None, help='Page size (max 100).')
+@click.option('--offset', type=int, default=None, help='Pagination offset.')
+@click.pass_context
+def auth_users(ctx: click.Context, limit: Optional[int], offset: Optional[int]) -> None:
+    """List platform users, oldest first (admin only).
+
+    Needs the tokens:manage scope as well as the admin role. Password hashes
+    and GitHub tokens are never included.
+    """
+    fetch_and_render(ctx, '/users', clean_params({'limit': limit, 'offset': offset}))
+
+
+@auth.command('set-role')
+@click.argument('user_id', type=int)
+@click.argument('role', type=click.Choice(USER_ROLES))
+@click.pass_context
+def auth_set_role(ctx: click.Context, user_id: int, role: str) -> None:
+    """Change a user's role (admin only).
+
+    You cannot change your own role: demoting the last admin here would leave
+    nobody able to undo it, so the API answers 403 (exit code 6).
+    """
+    send_and_render(ctx, 'PATCH', f'/users/{user_id}', {'role': role})

@@ -682,3 +682,261 @@ class ErrorsLogsArtifactsTests(unittest.TestCase):
         envelope = json.loads(result.stderr)
         self.assertEqual(envelope['error']['code'], 'log_not_found')
         self.assertIn('artifacts', envelope['error']['details']['action_required'])
+
+
+class WriteEndpointTests(unittest.TestCase):
+    """Cover the write and admin endpoints, pinned to the merged request schemas."""
+
+    def setUp(self):
+        """Create a runner for each test."""
+        self.runner = CliRunner()
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_run_create_posts_the_full_body(self, mock_request):
+        """`run create` maps its options onto RunCreateRequestSchema field names."""
+        mock_request.return_value = {'run_id': 9300, 'status': 'queued'}
+        sha = 'a' * 40
+        result = self.runner.invoke(cli, [
+            'run', 'create', '--commit', sha, '--platform', 'linux',
+            '--repository', 'CCExtractor/ccextractor', '--branch', 'feature/x',
+            '--pull-request', '42', '--test', '18', '--test', '137'])
+
+        self.assertEqual(result.exit_code, 0)
+        mock_request.assert_called_once_with('POST', '/runs', json_body={
+            'commit_sha': sha, 'platform': 'linux',
+            'repository': 'CCExtractor/ccextractor', 'branch': 'feature/x',
+            'pull_request': 42, 'regression_test_ids': [18, 137]})
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_run_create_rejects_a_short_sha_locally(self, mock_request):
+        """commit_sha is validated as 40 hex chars, so a short SHA never leaves the machine."""
+        for bad in ('e6cd34e', 'z' * 40, 'a' * 39):
+            result = self.runner.invoke(cli, [
+                'run', 'create', '--commit', bad, '--platform', 'linux',
+                '--repository', 'CCExtractor/ccextractor'])
+            self.assertNotEqual(result.exit_code, 0, f'{bad!r} should be rejected')
+        mock_request.assert_not_called()
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_run_create_rejects_a_malformed_repository(self, mock_request):
+        """repository must be owner/repo, not a bare name or a URL."""
+        for bad in ('ccextractor', 'https://github.com/CCExtractor/ccextractor'):
+            result = self.runner.invoke(cli, [
+                'run', 'create', '--commit', 'a' * 40, '--platform', 'linux',
+                '--repository', bad])
+            self.assertNotEqual(result.exit_code, 0, f'{bad!r} should be rejected')
+        mock_request.assert_not_called()
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_regression_create_sends_categories_by_name(self, mock_request):
+        """Categories are given by name and are required; active defaults off, like the API."""
+        mock_request.return_value = {'id': 5}
+        result = self.runner.invoke(cli, [
+            'regression', 'create', '--sample-id', '42', '--command', '-autoprogram',
+            '--category', 'DVB', '--category', 'General'])
+
+        self.assertEqual(result.exit_code, 0)
+        mock_request.assert_called_once_with('POST', '/regression-tests', json_body={
+            'sample_id': 42, 'command': '-autoprogram', 'categories': ['DVB', 'General']})
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_regression_create_sends_active_only_when_asked(self, mock_request):
+        """The API's load_default is False, so a bare create must not send active at all."""
+        mock_request.return_value = {'id': 5}
+        result = self.runner.invoke(cli, [
+            'regression', 'create', '--sample-id', '42', '--command', 'x',
+            '--category', 'DVB', '--active'])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertTrue(mock_request.call_args.kwargs['json_body']['active'])
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_regression_edit_requires_at_least_one_field(self, mock_request):
+        """An empty PATCH body is a usage error, not a pointless round trip."""
+        result = self.runner.invoke(cli, ['regression', 'edit', '18'])
+        self.assertNotEqual(result.exit_code, 0)
+        mock_request.assert_not_called()
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_regression_edit_patches_only_given_fields(self, mock_request):
+        """PATCH is sparse: untouched options must not appear in the body."""
+        mock_request.return_value = {'id': 18}
+        result = self.runner.invoke(cli, ['regression', 'edit', '18', '--inactive'])
+
+        self.assertEqual(result.exit_code, 0)
+        mock_request.assert_called_once_with(
+            'PATCH', '/regression-tests/18', json_body={'active': False})
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_regression_rm_confirms_before_deleting(self, mock_request):
+        """Deletion prompts unless --yes; declining must not issue the request."""
+        result = self.runner.invoke(cli, ['regression', 'rm', '18'], input='n\n')
+        self.assertNotEqual(result.exit_code, 0)
+        mock_request.assert_not_called()
+
+        mock_request.return_value = {'id': 18, 'deleted': True}
+        result = self.runner.invoke(cli, ['regression', 'rm', '18', '--yes'])
+        self.assertEqual(result.exit_code, 0)
+        mock_request.assert_called_once_with('DELETE', '/regression-tests/18', json_body=None)
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_a_refused_delete_maps_to_its_own_exit_code(self, mock_request):
+        """409 means the world disagreed, not that the body was wrong -- exit 8, not 5."""
+        mock_request.side_effect = ApiError(
+            'conflict', 'Regression test 18 has 12 historical result(s).', 409,
+            {'result_count': 12})
+        result = self.runner.invoke(cli, ['regression', 'rm', '18', '--yes'])
+
+        self.assertEqual(result.exit_code, 8)
+        self.assertEqual(json.loads(result.stderr)['error']['code'], 'conflict')
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_category_ls(self, mock_get):
+        """`category ls` reaches /categories with pagination."""
+        mock_get.return_value = {'data': [], 'pagination': {}}
+        result = self.runner.invoke(cli, ['category', 'ls', '--limit', '10'])
+
+        self.assertEqual(result.exit_code, 0)
+        mock_get.assert_called_once_with('/categories', params={'limit': 10})
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_category_create_and_edit(self, mock_request):
+        """Create takes a positional name; edit is sparse and needs a field."""
+        mock_request.return_value = {'id': 3, 'name': 'DVB'}
+        result = self.runner.invoke(cli, ['category', 'create', 'DVB', '--description', 'DVB subs'])
+        self.assertEqual(result.exit_code, 0)
+        mock_request.assert_called_once_with(
+            'POST', '/categories', json_body={'name': 'DVB', 'description': 'DVB subs'})
+
+        self.assertNotEqual(self.runner.invoke(cli, ['category', 'edit', '3']).exit_code, 0)
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_category_name_width_is_enforced_locally(self, mock_request):
+        """The name column is 64 chars; a longer one is rejected before the request."""
+        result = self.runner.invoke(cli, ['category', 'create', 'x' * 65])
+        self.assertNotEqual(result.exit_code, 0)
+        mock_request.assert_not_called()
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_sample_details(self, mock_get):
+        """`sample details` is a distinct endpoint from `sample show`."""
+        mock_get.return_value = {'sample_id': 42, 'media_info': None}
+        result = self.runner.invoke(cli, ['sample', 'details', '42'])
+
+        self.assertEqual(result.exit_code, 0)
+        mock_get.assert_called_once_with('/samples/42/details', params=None)
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_auth_whoami_and_users(self, mock_get):
+        """whoami hits /auth/me; users hits /users."""
+        mock_get.return_value = {'user_id': 1, 'role': 'admin'}
+        self.assertEqual(self.runner.invoke(cli, ['auth', 'whoami']).exit_code, 0)
+        mock_get.assert_called_with('/auth/me', params=None)
+
+        mock_get.return_value = {'data': [], 'pagination': {}}
+        self.assertEqual(self.runner.invoke(cli, ['auth', 'users']).exit_code, 0)
+        mock_get.assert_called_with('/users', params={})
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_auth_set_role_is_restricted_to_the_role_enum(self, mock_request):
+        """PATCH /users/{id} validates against Role, so reject anything else locally."""
+        self.assertNotEqual(
+            self.runner.invoke(cli, ['auth', 'set-role', '5', 'superuser']).exit_code, 0)
+        mock_request.assert_not_called()
+
+        mock_request.return_value = {'user_id': 5, 'role': 'contributor'}
+        result = self.runner.invoke(cli, ['auth', 'set-role', '5', 'contributor'])
+        self.assertEqual(result.exit_code, 0)
+        mock_request.assert_called_once_with(
+            'PATCH', '/users/5', json_body={'role': 'contributor'})
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_admin_pause_and_resume_send_the_disabled_flag(self, mock_request):
+        """Pause and resume are the same PATCH with opposite booleans."""
+        mock_request.return_value = {'platform': 'linux', 'disabled': True}
+        self.assertEqual(self.runner.invoke(cli, ['admin', 'pause', 'linux']).exit_code, 0)
+        mock_request.assert_called_with(
+            'PATCH', '/system/maintenance/linux', json_body={'disabled': True})
+
+        self.assertEqual(self.runner.invoke(cli, ['admin', 'resume', 'linux']).exit_code, 0)
+        mock_request.assert_called_with(
+            'PATCH', '/system/maintenance/linux', json_body={'disabled': False})
+
+        self.assertNotEqual(self.runner.invoke(cli, ['admin', 'pause', 'bsd']).exit_code, 0)
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_blocked_user_add_takes_the_numeric_github_id(self, mock_request):
+        """The API keys on the numeric id, since logins can be changed and reused."""
+        mock_request.return_value = {'user_id': 1234, 'comment': 'spam'}
+        result = self.runner.invoke(cli, ['admin', 'blocked-users', 'add', '1234',
+                                          '--comment', 'spam'])
+
+        self.assertEqual(result.exit_code, 0)
+        mock_request.assert_called_once_with(
+            'POST', '/system/blocked-users', json_body={'user_id': 1234, 'comment': 'spam'})
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_forbidden_extension_is_normalized_before_sending(self, mock_request):
+        """Stored without a leading dot and lower-cased, so normalize on the way out."""
+        mock_request.return_value = {'extension': 'mkv'}
+        result = self.runner.invoke(cli, ['admin', 'forbidden-extensions', 'add', '.MKV'])
+
+        self.assertEqual(result.exit_code, 0)
+        mock_request.assert_called_once_with(
+            'POST', '/system/forbidden-extensions', json_body={'extension': 'mkv'})
+
+        self.assertNotEqual(
+            self.runner.invoke(cli, ['admin', 'forbidden-extensions', 'add', 'mk*v']).exit_code, 0)
+
+
+class ScopeContractTests(unittest.TestCase):
+    """Pin the token scope list, which drifted once and broke every admin write.
+
+    `system:write` was missing from TOKEN_SCOPES, so Click rejected
+    `--scope system:write` as an invalid choice and no CLI-created token could
+    ever authorize `sp admin pause` / `blocked-users` / `forbidden-extensions`.
+    Mocked tests could not catch it; only a live call did.
+    """
+
+    def setUp(self):
+        """Create a runner for each test."""
+        self.runner = CliRunner()
+
+    def test_every_valid_scope_is_offered(self):
+        """The list must match mod_api.models.api_token.VALID_SCOPES exactly."""
+        from sp_cli.constants import TOKEN_MAX_SCOPES, TOKEN_SCOPES
+
+        self.assertEqual(set(TOKEN_SCOPES), {
+            'runs:read', 'runs:write', 'results:read', 'baselines:write',
+            'system:read', 'system:write', 'tokens:manage',
+        })
+        # The API validates Length(max=len(VALID_SCOPES)), so asking for
+        # everything you are allowed must never fail validation.
+        self.assertEqual(TOKEN_MAX_SCOPES, len(TOKEN_SCOPES))
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_system_write_is_accepted_by_login(self, mock_request):
+        """Without this scope every `sp admin` write command 403s."""
+        mock_request.return_value = {'token': 'x', 'scopes': ['system:write']}
+        result = self.runner.invoke(cli, [
+            'auth', 'login', '--email', 'a@b.c', '--password', 'pw',
+            '--scope', 'system:write'])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(mock_request.call_args.kwargs['json_body']['scopes'],
+                         ['system:write'])
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_asking_for_every_scope_at_once_is_allowed(self, mock_request):
+        """The cap is len(VALID_SCOPES), so a full-access token is requestable."""
+        from sp_cli.constants import TOKEN_SCOPES
+
+        mock_request.return_value = {'token': 'x', 'scopes': list(TOKEN_SCOPES)}
+        args = ['auth', 'login', '--email', 'a@b.c', '--password', 'pw']
+        for scope in TOKEN_SCOPES:
+            args += ['--scope', scope]
+        result = self.runner.invoke(cli, args)
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(len(mock_request.call_args.kwargs['json_body']['scopes']),
+                         len(TOKEN_SCOPES))

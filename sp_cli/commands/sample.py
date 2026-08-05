@@ -41,6 +41,19 @@ def sample_show(ctx: click.Context, sample_id: int) -> None:
     fetch_and_render(ctx, f'/samples/{sample_id}')
 
 
+@sample.command('details')
+@click.argument('sample_id', type=int)
+@click.pass_context
+def sample_details(ctx: click.Context, sample_id: int) -> None:
+    """Show everything known about a sample: upload record, extra files, media info.
+
+    Media info is best-effort -- missing or unparseable XML reports null rather
+    than failing the whole response. Unlike the web page this never regenerates
+    that XML, because a GET should not write to the sample repository.
+    """
+    fetch_and_render(ctx, f'/samples/{sample_id}/details')
+
+
 @sample.command('history')
 @click.argument('sample_id', type=int)
 @click.option('--platform', type=click.Choice(PLATFORMS), default=None, help='Test platform.')
