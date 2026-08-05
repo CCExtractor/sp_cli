@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 
 import click
 
+from sp_cli import config
 from sp_cli.client import ApiError
 from sp_cli.constants import (TOKEN_MAX_DAYS, TOKEN_MIN_DAYS, TOKEN_SCOPES,
                               USER_ROLES)
@@ -25,13 +26,19 @@ def auth() -> None:
               default=TOKEN_MAX_DAYS, show_default=True, help='Token lifetime in days.')
 @click.option('--scope', 'scopes', multiple=True, type=click.Choice(TOKEN_SCOPES),
               help='Grant a specific scope; repeatable. Omit for the server default set.')
+@click.option('--save/--no-save', 'save', default=True, show_default=True,
+              help='Save the token to ~/.config/sp/config.json (mode 0600) for later commands.')
 @click.pass_context
 def auth_login(ctx: click.Context, email: str, password: str, token_name: str,
-               expires_in_days: int, scopes: Tuple[str, ...]) -> None:
-    """Create an API token; store the printed value in SP_API_TOKEN.
+               expires_in_days: int, scopes: Tuple[str, ...], save: bool) -> None:
+    """Create an API token and save it for subsequent commands.
 
     The plaintext token is returned exactly once, at creation. Later `sp auth
-    tokens` calls list metadata only, so capture it now or create a new one.
+    tokens` calls list metadata only, so it is saved to
+    ~/.config/sp/config.json (mode 0600) unless --no-save is given.
+
+    Precedence when a command runs is --token > SP_API_TOKEN > this file, so an
+    explicit flag or env var still wins over a saved session.
     """
     client = ctx.obj['client']
     output = ctx.obj['output']
@@ -45,6 +52,11 @@ def auth_login(ctx: click.Context, email: str, password: str, token_name: str,
         render_error(error, output)
         raise SystemExit(error.exit_code)
 
+    token = result.get('token') if isinstance(result, dict) else None
+    if save and token:
+        path = config.save_token(token, ctx.obj.get('base_url'))
+        # To stderr so it never contaminates the JSON on stdout.
+        click.echo(f'Token saved to {path} (mode 0600).', err=True)
     render(result, output)
 
 
@@ -80,15 +92,21 @@ def auth_revoke(ctx: click.Context, token_id: int) -> None:
 @auth.command('logout')
 @click.pass_context
 def auth_logout(ctx: click.Context) -> None:
-    """Revoke the current API token."""
+    """Revoke the current API token and drop the saved session.
+
+    The local file is cleared even if the server call fails, so a token that
+    was already revoked or expired cannot leave a stale credential on disk.
+    """
     client = ctx.obj['client']
     output = ctx.obj['output']
     try:
         client.request('DELETE', '/auth/tokens/current')
     except ApiError as error:
+        config.clear_token()
         render_error(error, output)
         raise SystemExit(error.exit_code)
-    click.echo('Token revoked.')
+    cleared = config.clear_token()
+    click.echo('Token revoked.' + (' Saved session cleared.' if cleared else ''))
 
 
 @auth.command('whoami')

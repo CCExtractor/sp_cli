@@ -26,7 +26,7 @@ def fetch_and_render(ctx: click.Context, path: str, params: Optional[Dict[str, A
     except ApiError as error:
         render_error(error, output)
         raise SystemExit(error.exit_code)
-    render(payload, output)
+    render(payload, output, ctx.obj.get('color', False))
 
 
 def send_and_render(ctx: click.Context, method: str, path: str,
@@ -52,7 +52,7 @@ def send_and_render(ctx: click.Context, method: str, path: str,
     except ApiError as error:
         render_error(error, output)
         raise SystemExit(error.exit_code)
-    render(payload, output)
+    render(payload, output, ctx.obj.get('color', False))
 
 
 def clean_params(params: Dict[str, Any]) -> Dict[str, Any]:

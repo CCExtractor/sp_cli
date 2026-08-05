@@ -13,6 +13,7 @@ from sp_cli.constants import (ARTIFACT_TYPES, CANCEL_REASON_MIN_LENGTH,
                               MAX_REGRESSION_TEST_IDS, PLATFORMS, RUN_STATUSES,
                               SAMPLE_STATUSES)
 from sp_cli.output import render, render_error
+from sp_cli.progress import Spinner
 from sp_cli.runner import clean_params, fetch_and_render, send_and_render
 from sp_cli.triage import classify_sample, is_failure
 
@@ -116,13 +117,15 @@ def run_failures(ctx: click.Context, run_id: int) -> None:
     client = ctx.obj['client']
     output = ctx.obj['output']
     try:
-        samples = client.get_paginated(f'/runs/{run_id}/samples')
+        with Spinner(f'Fetching results for run {run_id}', output != 'json'):
+            samples = client.get_paginated(f'/runs/{run_id}/samples')
     except ApiError as error:
         render_error(error, output)
         raise SystemExit(error.exit_code)
 
     rows = [classify_sample(s) for s in samples if is_failure(s)]
-    render({'data': rows, 'summary': {'failures': len(rows), 'of_total': len(samples)}}, output)
+    render({'data': rows, 'summary': {'failures': len(rows), 'of_total': len(samples)}},
+           output, ctx.obj.get('color', False))
 
 
 @run.command('results')
@@ -186,7 +189,7 @@ def run_diff(ctx: click.Context, run_id: int, sample_id: int, regression_id: Opt
         render_error(error, output)
         raise SystemExit(error.exit_code)
 
-    render(diffs[0] if len(diffs) == 1 else {'data': diffs}, output)
+    render(diffs[0] if len(diffs) == 1 else {'data': diffs}, output, ctx.obj.get('color', False))
 
 
 @run.command('approve-baseline')
@@ -384,11 +387,12 @@ def run_logs(ctx: click.Context, run_id: int, level: Optional[str], source: Opti
     client = ctx.obj['client']
     output = ctx.obj['output']
     try:
-        lines = client.get_cursor_paginated(f'/runs/{run_id}/logs', params)
+        with Spinner(f'Reading log for run {run_id}', output != 'json'):
+            lines = client.get_cursor_paginated(f'/runs/{run_id}/logs', params)
     except ApiError as error:
         render_error(error, output)
         raise SystemExit(error.exit_code)
-    render({'data': lines, 'summary': {'lines': len(lines)}}, output)
+    render({'data': lines, 'summary': {'lines': len(lines)}}, output, ctx.obj.get('color', False))
 
 
 @run.command('errors')

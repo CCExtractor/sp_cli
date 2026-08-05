@@ -920,7 +920,7 @@ class ScopeContractTests(unittest.TestCase):
         mock_request.return_value = {'token': 'x', 'scopes': ['system:write']}
         result = self.runner.invoke(cli, [
             'auth', 'login', '--email', 'a@b.c', '--password', 'pw',
-            '--scope', 'system:write'])
+            '--scope', 'system:write', '--no-save'])
 
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(mock_request.call_args.kwargs['json_body']['scopes'],
@@ -932,7 +932,7 @@ class ScopeContractTests(unittest.TestCase):
         from sp_cli.constants import TOKEN_SCOPES
 
         mock_request.return_value = {'token': 'x', 'scopes': list(TOKEN_SCOPES)}
-        args = ['auth', 'login', '--email', 'a@b.c', '--password', 'pw']
+        args = ['auth', 'login', '--email', 'a@b.c', '--password', 'pw', '--no-save']
         for scope in TOKEN_SCOPES:
             args += ['--scope', scope]
         result = self.runner.invoke(cli, args)

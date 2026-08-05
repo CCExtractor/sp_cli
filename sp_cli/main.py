@@ -4,7 +4,7 @@ from typing import Optional
 
 import click
 
-from sp_cli import __version__
+from sp_cli import __version__, config
 from sp_cli.client import ApiClient
 from sp_cli.commands.admin import admin
 from sp_cli.commands.auth import auth
@@ -22,22 +22,36 @@ DEFAULT_BASE_URL = 'http://localhost:5000/api/v1'
 @click.option('--base-url', envvar='SP_BASE_URL', default=DEFAULT_BASE_URL, show_default=True,
               help='API base URL incl. the /api/v1 prefix. Env: SP_BASE_URL.')
 @click.option('--token', envvar='SP_API_TOKEN', default=None,
-              help='Bearer token sent with each request. Env: SP_API_TOKEN.')
+              help='Bearer token sent with each request. Env: SP_API_TOKEN. '
+                   'Falls back to the session saved by `sp auth login`.')
 @click.option('--output', '-o', type=click.Choice(['json', 'table']), default='json', show_default=True,
               help='Output format.')
 @click.option('--timeout', type=int, default=30, show_default=True, help='Per-request timeout (seconds).')
+@click.option('--no-color', is_flag=True, default=False,
+              help='Never colorize table output. Also honours the NO_COLOR environment variable.')
 @click.version_option(__version__, prog_name='sp')
 @click.pass_context
-def cli(ctx: click.Context, base_url: str, token: Optional[str], output: str, timeout: int) -> None:
+def cli(ctx: click.Context, base_url: str, token: Optional[str], output: str,
+        timeout: int, no_color: bool) -> None:
     """AI-friendly CLI for the CCExtractor CI / Sample Platform.
 
     Emits JSON by default so it can be driven by agents and scripts. Point it at
     a running platform with --base-url or the SP_BASE_URL environment variable,
     and authenticate with a token via --token / SP_API_TOKEN (see `sp auth login`).
     """
+    # Precedence: --token / SP_API_TOKEN (both bound to `token` by Click) beat
+    # the saved session, so an explicit credential always wins.
+    if token is None:
+        token = config.saved_token()
+        if token and config.is_world_readable():
+            click.echo(f'Warning: {config.config_path()} is readable by other users; '
+                       'run chmod 600 on it.', err=True)
+
     ctx.obj = {
         'client': ApiClient(base_url, token=token, timeout=timeout),
         'output': output,
+        'base_url': base_url,
+        'color': output == 'table' and not no_color,
     }
     if ctx.invoked_subcommand is None:
         from sp_cli.banner import show_welcome

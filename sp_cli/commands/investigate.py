@@ -8,6 +8,7 @@ from sp_cli.client import ApiError
 from sp_cli.history import (NEW_REGRESSION, classify_history, group_by_verdict,
                             split_history, unknown_history)
 from sp_cli.output import render, render_error
+from sp_cli.progress import Spinner
 from sp_cli.runner import clean_params
 from sp_cli.triage import classify_sample, group_by_code, is_failure
 
@@ -45,9 +46,10 @@ def investigate(ctx: click.Context, run_id: int, with_history: bool,
     depth = history_depth if history_depth is not None else DEFAULT_HISTORY_DEPTH
 
     try:
-        run = client.get(f'/runs/{run_id}')
-        summary = client.get(f'/runs/{run_id}/summary')
-        samples = client.get_paginated(f'/runs/{run_id}/samples')
+        with Spinner(f'Investigating run {run_id}', output != 'json'):
+            run = client.get(f'/runs/{run_id}')
+            summary = client.get(f'/runs/{run_id}/summary')
+            samples = client.get_paginated(f'/runs/{run_id}/samples')
     except ApiError as error:
         render_error(error, output)
         raise SystemExit(error.exit_code)
@@ -62,7 +64,8 @@ def investigate(ctx: click.Context, run_id: int, with_history: bool,
 
     if with_history:
         try:
-            _attach_history(client, failures, run_id, run.get('platform'), depth)
+            with Spinner('Fetching sample history', output != 'json'):
+                _attach_history(client, failures, run_id, run.get('platform'), depth)
         except ApiError as error:
             render_error(error, output)
             raise SystemExit(error.exit_code)
@@ -71,7 +74,7 @@ def investigate(ctx: click.Context, run_id: int, with_history: bool,
     if output == 'json':
         render(report, 'json')
     else:
-        _print_digest(report, with_history)
+        _print_digest(report, with_history, ctx.obj.get('color', False))
 
 
 def _attach_history(client: Any, failures: List[Dict[str, Any]], run_id: int,
@@ -113,7 +116,8 @@ def _attach_history(client: Any, failures: List[Dict[str, Any]], run_id: int,
         failure['history'] = classify_history(current, prior[:depth])
 
 
-def _print_digest(report: Dict[str, Any], with_history: bool = False) -> None:
+def _print_digest(report: Dict[str, Any], with_history: bool = False,
+                  color: bool = False) -> None:
     """
     Print a human-readable investigation digest.
 
@@ -121,6 +125,8 @@ def _print_digest(report: Dict[str, Any], with_history: bool = False) -> None:
     :type report: Dict[str, Any]
     :param with_history: Whether history verdicts were collected.
     :type with_history: bool
+    :param color: Whether to colorize the classification columns.
+    :type color: bool
     """
     run = report['run']
     summary = report['summary']
@@ -147,7 +153,7 @@ def _print_digest(report: Dict[str, Any], with_history: bool = False) -> None:
     failures: List[Dict[str, Any]] = report['failures']
     if failures:
         click.echo()
-        render({'data': [_flatten(f, with_history) for f in failures]}, 'table')
+        render({'data': [_flatten(f, with_history) for f in failures]}, 'table', color)
 
     _print_regressions(failures, with_history)
 

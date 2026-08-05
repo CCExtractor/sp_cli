@@ -1,6 +1,8 @@
 """Render API responses to the terminal as JSON (default) or a simple table."""
 
 import json
+import os
+import sys
 from typing import Any, Dict, List
 
 import click
@@ -10,8 +12,30 @@ from sp_cli.client import ApiError
 #: Value types rendered as plain table columns; nested structures are skipped.
 _SCALAR = (str, int, float, bool, type(None))
 
+#: Columns worth colorizing, and the colour each value gets. Severity reads
+#: left to right: red is a crash, yellow a wrong result, cyan a diff to review.
+_CODE_COLORS = {
+    'SEGFAULT': 'red',
+    'ABORT': 'red',
+    'TIMEOUT': 'yellow',
+    'EXIT_CODE_MISMATCH': 'yellow',
+    'MISSING_OUTPUT': 'magenta',
+    'OUTPUT_DIFF': 'cyan',
+    'PASS': 'green',
+    # `investigate --with-history` verdicts, shown in the same table.
+    'NEW_REGRESSION': 'red',
+    'STILL_FAILING': 'yellow',
+    'NEVER_PASSED': 'magenta',
+    'FLAKY': 'cyan',
+    'NO_HISTORY': 'white',
+    'UNKNOWN': 'white',
+}
 
-def render(payload: Any, output: str) -> None:
+#: Only these columns are ever colorized; everything else stays plain.
+_COLORIZED_COLUMNS = ('code', 'verdict')
+
+
+def render(payload: Any, output: str, color: bool = False) -> None:
     """
     Render a successful API payload in the requested format.
 
@@ -22,13 +46,17 @@ def render(payload: Any, output: str) -> None:
     :type payload: Any
     :param output: Either ``json`` or ``table``.
     :type output: str
+    :param color: Whether the caller wants colour; still suppressed when stdout
+        is not a TTY or ``NO_COLOR`` is set.
+    :type color: bool
     """
     if output == 'json':
         click.echo(json.dumps(payload, indent=2))
         return
 
+    use_color = _color_enabled(color)
     if isinstance(payload, dict) and isinstance(payload.get('data'), list):
-        _print_rows(payload['data'])
+        _print_rows(payload['data'], use_color)
         footer = _footer(payload)
         if footer:
             click.echo(f"\n{footer}")
@@ -36,6 +64,25 @@ def render(payload: Any, output: str) -> None:
         _print_kv(payload)
     else:
         click.echo(json.dumps(payload, indent=2))
+
+
+def _color_enabled(requested: bool) -> bool:
+    """
+    Decide whether colour may actually be emitted.
+
+    Colour is decoration, so it is dropped whenever the output is not a live
+    terminal -- piping into ``jq`` or a file must never receive escape codes.
+
+    :param requested: Whether the caller asked for colour.
+    :type requested: bool
+    :return: ``True`` only when colour is both wanted and safe.
+    :rtype: bool
+    """
+    if not requested:
+        return False
+    if os.environ.get('NO_COLOR'):
+        return False
+    return sys.stdout.isatty()
 
 
 def render_error(error: ApiError, output: str) -> None:
@@ -80,12 +127,14 @@ def _footer(payload: Dict[str, Any]) -> str:
     return ''
 
 
-def _print_rows(rows: List[Any]) -> None:
+def _print_rows(rows: List[Any], color: bool = False) -> None:
     """
     Print a list of flat dicts as an aligned table of their scalar fields.
 
     :param rows: The list of row dicts to render.
     :type rows: List[Any]
+    :param color: Whether to colorize the classification columns.
+    :type color: bool
     """
     if not rows:
         click.echo('(no results)')
@@ -108,7 +157,32 @@ def _print_rows(rows: List[Any]) -> None:
     click.echo('  '.join(col.ljust(widths[col]) for col in columns))
     click.echo('  '.join('-' * widths[col] for col in columns))
     for row in rows:
-        click.echo('  '.join(_cell(row.get(col)).ljust(widths[col]) for col in columns))
+        # Padded first, then styled: escape codes have no display width, so
+        # colorizing before ljust would push every later column out of line.
+        click.echo('  '.join(
+            _paint(_cell(row.get(col)).ljust(widths[col]), col, row.get(col), color)
+            for col in columns))
+
+
+def _paint(padded: str, column: str, value: Any, color: bool) -> str:
+    """
+    Apply the classification colour to an already-padded cell.
+
+    :param padded: The cell text, already widened to the column width.
+    :type padded: str
+    :param column: The column name the cell belongs to.
+    :type column: str
+    :param value: The raw cell value, used to pick the colour.
+    :type value: Any
+    :param color: Whether colour is enabled at all.
+    :type color: bool
+    :return: The cell, styled or untouched.
+    :rtype: str
+    """
+    if not color or column not in _COLORIZED_COLUMNS:
+        return padded
+    fg = _CODE_COLORS.get(str(value))
+    return click.style(padded, fg=fg) if fg else padded
 
 
 def _print_kv(record: Dict[str, Any]) -> None:
