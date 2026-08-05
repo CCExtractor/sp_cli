@@ -1007,3 +1007,76 @@ class OutputDecodeTests(unittest.TestCase):
         envelope = json.loads(result.stderr)
         self.assertEqual(envelope['error']['code'], 'no_content')
         self.assertIn('download_url', envelope['error']['details'])
+
+
+class HistoryDegradationTests(unittest.TestCase):
+    """A failed history lookup must not discard the whole investigation.
+
+    Found against production: /samples/{id}/history 504s there, and one failure
+    aborted the entire command -- throwing away the run summary and all 45
+    classified failures to report a single missing verdict.
+    """
+
+    def setUp(self):
+        """Create a runner for each test."""
+        self.runner = CliRunner()
+
+    RUN = {'run_id': 9388, 'platform': 'linux', 'status': 'fail'}
+    SUMMARY = {'fail_count': 2, 'total_samples': 2, 'pass_count': 0}
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_one_failed_lookup_does_not_lose_the_investigation(self, mock_get, mock_paginated):
+        """The classified failures still come back; only that row is UNKNOWN."""
+        mock_get.side_effect = [self.RUN, self.SUMMARY]
+        mock_paginated.side_effect = [
+            SAMPLES_WITH_IDS,
+            ApiError('connection_error', 'Read timed out.'),
+            [],
+        ]
+        result = self.runner.invoke(cli, ['investigate', '9388', '--with-history'])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        report = json.loads(result.stdout)
+        self.assertEqual(len(report['failures']), 2)
+        self.assertEqual(report['failures'][0]['history']['verdict'], 'UNKNOWN')
+        self.assertIn(42, report['history_incomplete']['failed_samples'])
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_it_stops_asking_after_repeated_failures(self, mock_get, mock_paginated):
+        """A down endpoint must not cost one full timeout per sample."""
+        many = [dict(s, sample_id=100 + i, regression_test_id=200 + i)
+                for i, s in enumerate(SAMPLES_WITH_IDS * 5)]
+        mock_get.side_effect = [self.RUN, self.SUMMARY]
+        mock_paginated.side_effect = [many] + [
+            ApiError('connection_error', 'Read timed out.') for _ in range(20)]
+
+        result = self.runner.invoke(cli, ['investigate', '9388', '--with-history'])
+
+        self.assertEqual(result.exit_code, 0)
+        report = json.loads(result.stdout)
+        self.assertTrue(report['history_incomplete']['gave_up'])
+        # 1 call for the samples list + at most the failure limit before giving up.
+        self.assertLessEqual(mock_paginated.call_count, 4)
+        self.assertEqual(len(report['failures']), len(many))
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_a_clean_run_reports_no_gap(self, mock_get, mock_paginated):
+        """history_incomplete is absent when every lookup succeeded."""
+        mock_get.side_effect = [self.RUN, self.SUMMARY]
+        mock_paginated.side_effect = [SAMPLES_WITH_IDS, [], []]
+        result = self.runner.invoke(cli, ['investigate', '9388', '--with-history'])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertNotIn('history_incomplete', json.loads(result.stdout))
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_the_run_itself_failing_is_still_fatal(self, mock_get, mock_paginated):
+        """Degrading history is fine; a missing run means there is no answer at all."""
+        mock_get.side_effect = ApiError('not_found', 'Run 1 not found', 404)
+        result = self.runner.invoke(cli, ['investigate', '1', '--with-history'])
+
+        self.assertEqual(result.exit_code, 4)

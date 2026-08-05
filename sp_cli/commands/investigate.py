@@ -14,6 +14,11 @@ from sp_cli.triage import classify_sample, group_by_code, is_failure
 
 _RUN_FIELDS = ('run_id', 'pr_number', 'platform', 'commit_sha', 'branch', 'status', 'github_link')
 
+#: Consecutive failed history lookups before the endpoint is treated as down.
+#: Without this a broken endpoint costs one full timeout per failing sample --
+#: 45 samples x 30s is a 22-minute hang for an answer that will not come.
+_HISTORY_FAILURE_LIMIT = 3
+
 #: How many prior runs to weigh per failure when --with-history is used. Deep
 #: enough to see a sample settle, shallow enough to keep it one call per sample.
 DEFAULT_HISTORY_DEPTH = 20
@@ -63,13 +68,11 @@ def investigate(ctx: click.Context, run_id: int, with_history: bool,
     }
 
     if with_history:
-        try:
-            with Spinner('Fetching sample history', output != 'json'):
-                _attach_history(client, failures, run_id, run.get('platform'), depth)
-        except ApiError as error:
-            render_error(error, output)
-            raise SystemExit(error.exit_code)
+        with Spinner('Fetching sample history', output != 'json'):
+            degraded = _attach_history(client, failures, run_id, run.get('platform'), depth)
         report['by_verdict'] = group_by_verdict(failures)
+        if degraded:
+            report['history_incomplete'] = degraded
 
     if output == 'json':
         render(report, 'json')
@@ -78,7 +81,7 @@ def investigate(ctx: click.Context, run_id: int, with_history: bool,
 
 
 def _attach_history(client: Any, failures: List[Dict[str, Any]], run_id: int,
-                    platform: Optional[str], depth: int) -> None:
+                    platform: Optional[str], depth: int) -> Optional[Dict[str, Any]]:
     """
     Add a ``history`` verdict block to every failure row, in place.
 
@@ -86,6 +89,13 @@ def _attach_history(client: Any, failures: List[Dict[str, Any]], run_id: int,
     sample, so responses are cached by sample id and then narrowed per failure
     by regression test id. Restricting to the run's own platform keeps a Windows
     failure from being judged against Linux history.
+
+    A lookup that fails degrades that one row to UNKNOWN rather than aborting:
+    the classified failures and the run summary are the bulk of the answer, and
+    throwing all of it away because one sample's history is unavailable is worse
+    than reporting the gap. After ``_HISTORY_FAILURE_LIMIT`` consecutive
+    failures the endpoint is treated as down and the rest are marked without
+    calling it -- otherwise a broken endpoint costs one full timeout per sample.
 
     :param client: The API client.
     :type client: Any
@@ -97,23 +107,53 @@ def _attach_history(client: Any, failures: List[Dict[str, Any]], run_id: int,
     :type platform: Optional[str]
     :param depth: How many prior runs to consider per failure.
     :type depth: int
+    :return: A summary of what could not be fetched, or ``None`` if all of it was.
+    :rtype: Optional[Dict[str, Any]]
     """
     cache: Dict[int, List[Dict[str, Any]]] = {}
+    consecutive_failures = 0
+    given_up = False
+    failed_samples: List[int] = []
+    last_error: Optional[str] = None
+
     for failure in failures:
         sample_id = failure.get('sample_id')
         if not isinstance(sample_id, int):
             failure['history'] = unknown_history('Result has no sample id to look up')
             continue
 
+        if given_up:
+            failure['history'] = unknown_history(
+                'Skipped: the history endpoint is not responding')
+            continue
+
         if sample_id not in cache:
             # +1 so the current run's own entry cannot displace an older one.
             params = clean_params({'platform': platform, 'limit': depth + 1})
-            cache[sample_id] = client.get_paginated(
-                f'/samples/{sample_id}/history', params=params, max_items=depth + 1)
+            try:
+                cache[sample_id] = client.get_paginated(
+                    f'/samples/{sample_id}/history', params=params, max_items=depth + 1)
+                consecutive_failures = 0
+            except ApiError as error:
+                consecutive_failures += 1
+                last_error = error.message
+                failed_samples.append(sample_id)
+                failure['history'] = unknown_history(f'History lookup failed: {error.code}')
+                if consecutive_failures >= _HISTORY_FAILURE_LIMIT:
+                    given_up = True
+                continue
 
         current, prior = split_history(cache[sample_id], run_id,
                                        failure.get('regression_test_id'))
         failure['history'] = classify_history(current, prior[:depth])
+
+    if not failed_samples:
+        return None
+    return {
+        'failed_samples': failed_samples,
+        'gave_up': given_up,
+        'reason': last_error,
+    }
 
 
 def _print_digest(report: Dict[str, Any], with_history: bool = False,
@@ -149,6 +189,15 @@ def _print_digest(report: Dict[str, Any], with_history: bool = False,
         click.echo("  by history:")
         for verdict, count in by_verdict.items():
             click.echo(f"    {str(count).rjust(4)}  {verdict}")
+
+    incomplete = report.get('history_incomplete')
+    if incomplete:
+        # To stderr: the digest itself stays the answer, this is a caveat on it.
+        note = (f"  note: history unavailable for {len(incomplete['failed_samples'])} "
+                f"sample(s); those rows are UNKNOWN")
+        if incomplete.get('gave_up'):
+            note += ' (stopped asking after repeated failures)'
+        click.echo(note, err=True)
 
     failures: List[Dict[str, Any]] = report['failures']
     if failures:
