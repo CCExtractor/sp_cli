@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import click
 
 from sp_cli.client import ApiError
+from sp_cli.constants import (CANCEL_REASON_MIN_LENGTH, PLATFORMS,
+                              RUN_STATUSES, SAMPLE_STATUSES)
 from sp_cli.output import render, render_error
 from sp_cli.runner import clean_params, fetch_and_render
 from sp_cli.triage import classify_sample, is_failure
@@ -16,18 +18,34 @@ def run() -> None:
 
 
 @run.command('ls')
-@click.option('--status', default=None, help='queued|running|pass|fail|canceled|error|incomplete')
-@click.option('--platform', default=None, help='linux|windows')
+@click.option('--status', type=click.Choice(RUN_STATUSES), default=None,
+              help='Filter by lifecycle status. The API only tracks these three.')
+@click.option('--platform', type=click.Choice(PLATFORMS), default=None, help='Test platform.')
 @click.option('--branch', default=None, help='Filter by branch name.')
 @click.option('--commit', 'commit_sha', default=None, help='Full 40-char commit SHA.')
+@click.option('--repository', default=None, help='Filter by fork, as owner/repo.')
+@click.option('--sort', default=None, help='Sort key, e.g. -created_at (default) or run_id.')
+@click.option('--created-after', 'created_after', default=None,
+              help='Only runs first seen at/after this time (ISO 8601).')
+@click.option('--created-before', 'created_before', default=None,
+              help='Only runs first seen at/before this time (ISO 8601).')
 @click.option('--limit', type=int, default=None, help='Page size (max 100).')
 @click.option('--offset', type=int, default=None, help='Pagination offset.')
 @click.pass_context
 def run_ls(ctx: click.Context, status: Optional[str], platform: Optional[str], branch: Optional[str],
-           commit_sha: Optional[str], limit: Optional[int], offset: Optional[int]) -> None:
-    """List CI runs (newest first)."""
+           commit_sha: Optional[str], repository: Optional[str], sort: Optional[str],
+           created_after: Optional[str], created_before: Optional[str],
+           limit: Optional[int], offset: Optional[int]) -> None:
+    """List CI runs (newest first).
+
+    --status only accepts queued, running, and canceled: the API derives them
+    from the latest TestProgress row, and pass/fail are per-sample outcomes
+    rather than run states. Use `sp run summary` for a run's pass/fail split.
+    """
     params = clean_params({'status': status, 'platform': platform, 'branch': branch,
-                           'commit_sha': commit_sha, 'limit': limit, 'offset': offset})
+                           'commit_sha': commit_sha, 'repository': repository, 'sort': sort,
+                           'created_after': created_after, 'created_before': created_before,
+                           'limit': limit, 'offset': offset})
     fetch_and_render(ctx, '/runs', params)
 
 
@@ -66,14 +84,20 @@ def run_failures(ctx: click.Context, run_id: int) -> None:
 
 @run.command('results')
 @click.argument('run_id', type=int)
-@click.option('--status', default=None, help='pass|fail|skipped|missing_output|running|not_started')
+@click.option('--status', type=click.Choice(SAMPLE_STATUSES), default=None,
+              help='Filter by per-sample outcome.')
+@click.option('--name', default=None, help='Substring match on the sample name.')
+@click.option('--tag', default=None, help='Filter by sample tag.')
+@click.option('--category', default=None, help='Filter by regression-test category.')
 @click.option('--limit', type=int, default=None, help='Page size (max 100).')
 @click.option('--offset', type=int, default=None, help='Pagination offset.')
 @click.pass_context
-def run_results(ctx: click.Context, run_id: int, status: Optional[str],
+def run_results(ctx: click.Context, run_id: int, status: Optional[str], name: Optional[str],
+                tag: Optional[str], category: Optional[str],
                 limit: Optional[int], offset: Optional[int]) -> None:
     """List all regression-test results in a run."""
-    params = clean_params({'status': status, 'limit': limit, 'offset': offset})
+    params = clean_params({'status': status, 'name': name, 'tag': tag, 'category': category,
+                           'limit': limit, 'offset': offset})
     fetch_and_render(ctx, f'/runs/{run_id}/samples', params)
 
 
@@ -165,6 +189,90 @@ def run_approve_baseline(ctx: click.Context, run_id: int, sample_id: int,
         raise SystemExit(error.exit_code)
 
     render(result, output)
+
+
+@run.command('progress')
+@click.argument('run_id', type=int)
+@click.option('--limit', type=int, default=None, help='Page size (max 100).')
+@click.option('--offset', type=int, default=None, help='Pagination offset.')
+@click.pass_context
+def run_progress(ctx: click.Context, run_id: int, limit: Optional[int],
+                 offset: Optional[int]) -> None:
+    """Show the timeline of progress events the CI worker recorded for a run."""
+    params = clean_params({'limit': limit, 'offset': offset})
+    fetch_and_render(ctx, f'/runs/{run_id}/progress', params)
+
+
+@run.command('config')
+@click.argument('run_id', type=int)
+@click.pass_context
+def run_config(ctx: click.Context, run_id: int) -> None:
+    """Show the platform, branch, commit, and regression tests a run was launched with."""
+    fetch_and_render(ctx, f'/runs/{run_id}/config')
+
+
+@run.command('cancel')
+@click.argument('run_id', type=int)
+@click.option('--reason', default=None,
+              help=f'Why the run is being canceled (min {CANCEL_REASON_MIN_LENGTH} characters).')
+@click.pass_context
+def run_cancel(ctx: click.Context, run_id: int, reason: Optional[str]) -> None:
+    """Cancel a queued or running test.
+
+    Requires the ``runs:write`` scope. Idempotent: canceling a run that has
+    already finished succeeds and reports ``status=no_op`` rather than failing.
+    """
+    client = ctx.obj['client']
+    output = ctx.obj['output']
+    if reason is not None and len(reason.strip()) < CANCEL_REASON_MIN_LENGTH:
+        raise click.BadParameter(
+            f'must be at least {CANCEL_REASON_MIN_LENGTH} characters', param_hint='--reason')
+    body = {'reason': reason} if reason else None
+    try:
+        result = client.request('POST', f'/runs/{run_id}/cancel', json_body=body)
+    except ApiError as error:
+        render_error(error, output)
+        raise SystemExit(error.exit_code)
+    render(result, output)
+
+
+@run.command('output')
+@click.argument('run_id', type=int)
+@click.argument('sample_id', type=int)
+@click.option('--regression', 'regression_id', type=int, default=None,
+              help='Regression test id (auto-resolved if omitted).')
+@click.option('--output', 'output_id', type=int, default=None,
+              help='Output file id (auto-resolved if omitted).')
+@click.option('--side', type=click.Choice(('expected', 'actual')), default='actual',
+              show_default=True, help='Which side of the comparison to fetch.')
+@click.option('--format', 'fmt', default=None, help='Response format accepted by the API.')
+@click.pass_context
+def run_output(ctx: click.Context, run_id: int, sample_id: int, regression_id: Optional[int],
+               output_id: Optional[int], side: str, fmt: Optional[str]) -> None:
+    """Fetch one side of a result's output file.
+
+    Resolves the (media sample, regression, output) ids the same way `sp run
+    diff` does, so the hidden ids the web UI needs are not required here.
+
+    Note: for an output that matched, the API answers ``actual`` with a 303
+    redirect to ``expected`` -- requests follows it, so the expected content is
+    what comes back.
+    """
+    client = ctx.obj['client']
+    output = ctx.obj['output']
+    try:
+        targets = _resolve_diff_targets(client, run_id, sample_id, regression_id, output_id)
+        if not targets:
+            raise ApiError('not_found', 'No output to fetch for this result', 404)
+        media_sample_id, reg_id, out_id = targets[0]
+        payload = client.get(
+            f'/runs/{run_id}/samples/{media_sample_id}'
+            f'/regression-tests/{reg_id}/outputs/{out_id}/{side}',
+            params=clean_params({'format': fmt}))
+    except ApiError as error:
+        render_error(error, output)
+        raise SystemExit(error.exit_code)
+    render(payload, output)
 
 
 @run.command('artifacts')

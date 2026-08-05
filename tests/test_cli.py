@@ -26,6 +26,15 @@ RUN_SAMPLES = [
      'status': 'pass', 'exit_code': 0, 'expected_rc': 0, 'outputs': []},
 ]
 
+# Two failures on distinct media samples, which is what history lookups key on.
+SAMPLES_WITH_IDS = [
+    {'regression_test_id': 18, 'sample_id': 42, 'sample_name': 'dvb', 'categories': ['DVB'],
+     'status': 'fail', 'exit_code': 10, 'expected_rc': 0, 'outputs': []},
+    {'regression_test_id': 137, 'sample_id': 43, 'sample_name': 'cea708',
+     'categories': ['CEA-708'], 'status': 'missing_output', 'exit_code': 0,
+     'expected_rc': 0, 'outputs': []},
+]
+
 
 class CliCommandTests(unittest.TestCase):
     """Exercise the CLI commands with a mocked client."""
@@ -184,3 +193,190 @@ class CliCommandTests(unittest.TestCase):
         self.assertEqual(report['by_code'],
                          {'SEGFAULT': 1, 'EXIT_CODE_MISMATCH': 1, 'MISSING_OUTPUT': 1})
         self.assertEqual(len(report['failures']), 3)
+
+
+class ApiContractTests(unittest.TestCase):
+    """Pin the CLI surface to what the merged ``mod_api`` blueprint actually accepts.
+
+    Every enumeration asserted here mirrors a validator in the platform repo, so
+    a drift on either side should fail loudly instead of costing an HTTP 400.
+    """
+
+    def setUp(self):
+        """Create a runner for each test."""
+        self.runner = CliRunner()
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_run_ls_rejects_statuses_the_api_does_not_support(self, mock_get):
+        """`run ls --status` only offers queued/running/canceled, and rejects the rest locally."""
+        for bad_status in ('pass', 'fail', 'error', 'incomplete'):
+            result = self.runner.invoke(cli, ['run', 'ls', '--status', bad_status])
+            self.assertNotEqual(result.exit_code, 0, f'{bad_status} should be rejected')
+        mock_get.assert_not_called()
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_run_ls_forwards_repository_sort_and_date_filters(self, mock_get):
+        """`run ls` passes through every filter /runs declares."""
+        mock_get.return_value = RUNS_PAGE
+        result = self.runner.invoke(cli, [
+            'run', 'ls', '--repository', 'CCExtractor/ccextractor', '--sort', '-created_at',
+            '--created-after', '2026-07-01T00:00:00Z', '--created-before', '2026-07-31T00:00:00Z'])
+
+        self.assertEqual(result.exit_code, 0)
+        mock_get.assert_called_once_with('/runs', params={
+            'repository': 'CCExtractor/ccextractor', 'sort': '-created_at',
+            'created_after': '2026-07-01T00:00:00Z', 'created_before': '2026-07-31T00:00:00Z'})
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_run_results_rejects_unsupported_status(self, mock_get):
+        """'skipped' and 'running' are not in the API's _VALID_SAMPLE_STATUSES."""
+        for bad_status in ('skipped', 'running'):
+            result = self.runner.invoke(cli, ['run', 'results', '9299', '--status', bad_status])
+            self.assertNotEqual(result.exit_code, 0, f'{bad_status} should be rejected')
+        mock_get.assert_not_called()
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_run_results_forwards_name_tag_and_category(self, mock_get):
+        """`run results` supports the joined-field filters /runs/{id}/samples applies."""
+        mock_get.return_value = {'data': [], 'pagination': {}}
+        result = self.runner.invoke(cli, ['run', 'results', '9299', '--status', 'missing_output',
+                                          '--name', 'dvb', '--tag', 'teletext', '--category', 'DVB'])
+
+        self.assertEqual(result.exit_code, 0)
+        mock_get.assert_called_once_with('/runs/9299/samples', params={
+            'status': 'missing_output', 'name': 'dvb', 'tag': 'teletext', 'category': 'DVB'})
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_run_progress_and_config(self, mock_get):
+        """`run progress` and `run config` reach their merged endpoints."""
+        mock_get.return_value = {'data': [], 'pagination': {}}
+        self.assertEqual(self.runner.invoke(cli, ['run', 'progress', '9299']).exit_code, 0)
+        mock_get.assert_called_with('/runs/9299/progress', params={})
+
+        mock_get.return_value = {'run_id': 9299, 'platform': 'windows'}
+        self.assertEqual(self.runner.invoke(cli, ['run', 'config', '9299']).exit_code, 0)
+        mock_get.assert_called_with('/runs/9299/config', params=None)
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_run_cancel_posts_with_reason(self, mock_request):
+        """`run cancel` POSTs the reason when one is given."""
+        mock_request.return_value = {'run_id': 9299, 'action': 'cancel', 'status': 'canceled'}
+        result = self.runner.invoke(cli, ['run', 'cancel', '9299', '--reason', 'superseded by 9300'])
+
+        self.assertEqual(result.exit_code, 0)
+        mock_request.assert_called_once_with('POST', '/runs/9299/cancel',
+                                             json_body={'reason': 'superseded by 9300'})
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_run_cancel_omits_body_when_no_reason(self, mock_request):
+        """No reason means no body, rather than a null the schema would reject."""
+        mock_request.return_value = {'run_id': 9299, 'status': 'canceled'}
+        result = self.runner.invoke(cli, ['run', 'cancel', '9299'])
+
+        self.assertEqual(result.exit_code, 0)
+        mock_request.assert_called_once_with('POST', '/runs/9299/cancel', json_body=None)
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_run_cancel_rejects_short_reason_before_the_request(self, mock_request):
+        """The API needs 5+ characters; catch it locally instead of round-tripping a 400."""
+        result = self.runner.invoke(cli, ['run', 'cancel', '9299', '--reason', 'no'])
+
+        self.assertNotEqual(result.exit_code, 0)
+        mock_request.assert_not_called()
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_run_output_resolves_ids_like_diff(self, mock_get):
+        """`run output` reuses the diff resolver, so the hidden ids stay optional."""
+        mock_get.side_effect = [
+            {'regression_test_id': 137, 'sample_id': 42,
+             'outputs': [{'output_id': 2, 'status': 'fail'}]},
+            {'content': 'line', 'truncated': False},
+        ]
+        result = self.runner.invoke(cli, ['run', 'output', '9299', '5', '--side', 'expected'])
+
+        self.assertEqual(result.exit_code, 0)
+        args, kwargs = mock_get.call_args
+        self.assertEqual(args[0], '/runs/9299/samples/42/regression-tests/137/outputs/2/expected')
+        self.assertEqual(kwargs['params'], {})
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_auth_login_rejects_lifetime_over_the_api_cap(self, mock_request):
+        """expires_in_days is validated as Range(min=1, max=30) server-side."""
+        result = self.runner.invoke(cli, ['auth', 'login', '--email', 'a@b.co',
+                                          '--password', 'hunter22', '--days', '60'])
+
+        self.assertNotEqual(result.exit_code, 0)
+        mock_request.assert_not_called()
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_auth_login_sends_scopes_only_when_requested(self, mock_request):
+        """Omitting --scope leaves the field out so the server picks its default set."""
+        mock_request.return_value = {'token': 'spci_x', 'token_name': 'sp-cli', 'scopes': []}
+        result = self.runner.invoke(cli, ['auth', 'login', '--email', 'a@b.co',
+                                          '--password', 'hunter22', '--scope', 'runs:read',
+                                          '--scope', 'results:read'])
+
+        self.assertEqual(result.exit_code, 0)
+        body = mock_request.call_args.kwargs['json_body']
+        self.assertEqual(body['scopes'], ['runs:read', 'results:read'])
+        self.assertEqual(body['expires_in_days'], 30)
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_auth_tokens_lists_metadata(self, mock_get):
+        """`auth tokens` reads the list endpoint."""
+        mock_get.return_value = {'data': [], 'pagination': {}}
+        result = self.runner.invoke(cli, ['auth', 'tokens'])
+
+        self.assertEqual(result.exit_code, 0)
+        mock_get.assert_called_once_with('/auth/tokens', params={})
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_auth_revoke_targets_one_token(self, mock_request):
+        """`auth revoke <id>` deletes that token, not the current one."""
+        mock_request.return_value = None
+        result = self.runner.invoke(cli, ['auth', 'revoke', '7'])
+
+        self.assertEqual(result.exit_code, 0)
+        mock_request.assert_called_once_with('DELETE', '/auth/tokens/7')
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_sample_ls_forwards_sha256_and_catalog_status(self, mock_get):
+        """`sample ls` covers every filter /samples declares."""
+        mock_get.return_value = {'data': [], 'pagination': {}}
+        result = self.runner.invoke(cli, ['sample', 'ls', '--sha256', 'abc123',
+                                          '--status', 'inactive'])
+
+        self.assertEqual(result.exit_code, 0)
+        mock_get.assert_called_once_with('/samples',
+                                         params={'sha256': 'abc123', 'status': 'inactive'})
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_sample_history_forwards_branch_and_date_window(self, mock_get):
+        """`sample history` supports the branch/date filters the endpoint applies."""
+        mock_get.return_value = {'data': [], 'pagination': {}}
+        result = self.runner.invoke(cli, ['sample', 'history', '42', '--branch', 'master',
+                                          '--status', 'fail', '--created-after', '2026-07-01T00:00:00Z'])
+
+        self.assertEqual(result.exit_code, 0)
+        mock_get.assert_called_once_with('/samples/42/history', params={
+            'branch': 'master', 'status': 'fail', 'created_after': '2026-07-01T00:00:00Z'})
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_regression_ls_inactive_is_a_two_way_switch(self, mock_get):
+        """--inactive sends active=false; omitting it lets the API default to active only."""
+        mock_get.return_value = {'data': [], 'pagination': {}}
+        self.assertEqual(self.runner.invoke(cli, ['regression', 'ls', '--inactive']).exit_code, 0)
+        mock_get.assert_called_with('/regression-tests', params={'active': False})
+
+        self.assertEqual(self.runner.invoke(cli, ['regression', 'ls']).exit_code, 0)
+        mock_get.assert_called_with('/regression-tests', params={})
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_queue_rejects_non_queue_status_and_paginates(self, mock_get):
+        """/system/queue only knows queued and running, and accepts pagination."""
+        self.assertNotEqual(self.runner.invoke(cli, ['queue', '--status', 'canceled']).exit_code, 0)
+
+        mock_get.return_value = {'data': [], 'pagination': {}}
+        result = self.runner.invoke(cli, ['queue', '--status', 'queued', '--limit', '10'])
+        self.assertEqual(result.exit_code, 0)
+        mock_get.assert_called_once_with('/system/queue', params={'status': 'queued', 'limit': 10})

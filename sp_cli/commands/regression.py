@@ -15,7 +15,8 @@ def regression() -> None:
 @regression.command('ls')
 @click.option('--category', default=None, help='Filter by category name.')
 @click.option('--tag', default=None, help='Filter by tag.')
-@click.option('--active/--all', 'active', default=None, help='Only active tests (default: all).')
+@click.option('--active/--inactive', 'active', default=None,
+              help='Select active or inactive tests (default: active only).')
 @click.option('--sample-id', type=int, default=None, help='Filter by sample id.')
 @click.option('--limit', type=int, default=None, help='Page size (max 100).')
 @click.option('--offset', type=int, default=None, help='Pagination offset.')
@@ -23,7 +24,12 @@ def regression() -> None:
 def regression_ls(ctx: click.Context, category: Optional[str], tag: Optional[str],
                   active: Optional[bool], sample_id: Optional[int],
                   limit: Optional[int], offset: Optional[int]) -> None:
-    """List regression-test definitions."""
+    """List regression-test definitions.
+
+    The API's ``active`` filter is a two-way switch with no "everything"
+    setting: omitting it lists active tests only, and ``--inactive`` lists
+    inactive ones only. Run the command twice to see both.
+    """
     params = clean_params({'category': category, 'tag': tag, 'active': active,
                            'sample_id': sample_id, 'limit': limit, 'offset': offset})
     fetch_and_render(ctx, '/regression-tests', params)
