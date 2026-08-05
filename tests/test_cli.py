@@ -195,6 +195,166 @@ class CliCommandTests(unittest.TestCase):
         self.assertEqual(len(report['failures']), 3)
 
 
+class InvestigateHistoryTests(unittest.TestCase):
+    """`investigate --with-history` separates new regressions from known gaps."""
+
+    def setUp(self):
+        """Create a runner for each test."""
+        self.runner = CliRunner()
+
+    @staticmethod
+    def _history_for(regression_test_id):
+        """
+        Build a plausible history for one regression test.
+
+        :param regression_test_id: The regression test the entries belong to.
+        :type regression_test_id: int
+        :return: History entries, newest first.
+        :rtype: list
+        """
+        return [
+            {'run_id': 9299, 'regression_test_id': regression_test_id, 'status': 'fail',
+             'failure_signature': 'exit_code_mismatch:rc:10'},
+            {'run_id': 9298, 'regression_test_id': regression_test_id, 'status': 'pass',
+             'failure_signature': None},
+        ]
+
+    def _invoke(self, mock_get, mock_paginated, args, histories):
+        """
+        Run `investigate` with the run/summary/samples calls and histories stubbed.
+
+        :param mock_get: The patched ``ApiClient.get``.
+        :param mock_paginated: The patched ``ApiClient.get_paginated``.
+        :param args: CLI arguments.
+        :type args: list
+        :param histories: Per-sample history responses, keyed by sample id.
+        :type histories: dict
+        :return: The Click result.
+        """
+        mock_get.side_effect = [
+            {'run_id': 9299, 'pr_number': 2264, 'platform': 'windows', 'status': 'fail'},
+            {'run_id': 9299, 'total_samples': 2, 'pass_count': 0, 'fail_count': 2},
+        ]
+
+        def paginated(path, params=None, max_items=1000):
+            if path.endswith('/samples'):
+                return SAMPLES_WITH_IDS
+            sample_id = int(path.split('/samples/')[1].split('/')[0])
+            return histories.get(sample_id, [])
+
+        mock_paginated.side_effect = paginated
+        return self.runner.invoke(cli, args)
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_history_labels_regression_versus_never_passing(self, mock_get, mock_paginated):
+        """A sample that passed last run is a regression; one that never passed is not."""
+        result = self._invoke(mock_get, mock_paginated,
+                              ['investigate', '9299', '--with-history'],
+                              {42: self._history_for(18),
+                               43: [{'run_id': 9298, 'regression_test_id': 137,
+                                     'status': 'fail', 'failure_signature': 'missing_output'}]})
+
+        self.assertEqual(result.exit_code, 0)
+        report = json.loads(result.output)
+        verdicts = {f['regression_test_id']: f['history']['verdict'] for f in report['failures']}
+        self.assertEqual(verdicts, {18: 'NEW_REGRESSION', 137: 'NEVER_PASSED'})
+        self.assertEqual(report['by_verdict'], {'NEW_REGRESSION': 1, 'NEVER_PASSED': 1})
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_history_is_filtered_to_the_run_platform(self, mock_get, mock_paginated):
+        """A Windows failure must not be judged against Linux history."""
+        self._invoke(mock_get, mock_paginated, ['investigate', '9299', '--with-history'],
+                     {42: self._history_for(18), 43: self._history_for(137)})
+
+        history_calls = [c for c in mock_paginated.call_args_list
+                         if '/history' in c.args[0]]
+        self.assertEqual(len(history_calls), 2)
+        for call in history_calls:
+            self.assertEqual(call.kwargs['params']['platform'], 'windows')
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_history_depth_implies_the_flag_and_sets_the_page_size(self, mock_get, mock_paginated):
+        """--history-depth alone turns history on, and asks for depth + the current run."""
+        result = self._invoke(mock_get, mock_paginated,
+                              ['investigate', '9299', '--history-depth', '5'],
+                              {42: self._history_for(18), 43: self._history_for(137)})
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn('by_verdict', json.loads(result.output))
+        history_call = next(c for c in mock_paginated.call_args_list if '/history' in c.args[0])
+        self.assertEqual(history_call.kwargs['params']['limit'], 6)
+        self.assertEqual(history_call.kwargs['max_items'], 6)
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_without_the_flag_no_history_is_fetched(self, mock_get, mock_paginated):
+        """The default stays one call per run — history is opt-in."""
+        result = self._invoke(mock_get, mock_paginated, ['investigate', '9299'], {})
+
+        self.assertEqual(result.exit_code, 0)
+        report = json.loads(result.output)
+        self.assertNotIn('by_verdict', report)
+        self.assertNotIn('history', report['failures'][0])
+        self.assertFalse([c for c in mock_paginated.call_args_list if '/history' in c.args[0]])
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_one_lookup_per_sample_even_when_tests_share_it(self, mock_get, mock_paginated):
+        """Two regression tests on one sample must not cost two history calls."""
+        mock_get.side_effect = [
+            {'run_id': 9299, 'platform': 'windows', 'status': 'fail'},
+            {'run_id': 9299, 'total_samples': 2, 'pass_count': 0, 'fail_count': 2},
+        ]
+        shared = [dict(s, sample_id=42) for s in SAMPLES_WITH_IDS]
+
+        def paginated(path, params=None, max_items=1000):
+            if path.endswith('/samples'):
+                return shared
+            return self._history_for(18) + self._history_for(137)
+
+        mock_paginated.side_effect = paginated
+        result = self.runner.invoke(cli, ['investigate', '9299', '--with-history'])
+
+        self.assertEqual(result.exit_code, 0)
+        history_calls = [c for c in mock_paginated.call_args_list if '/history' in c.args[0]]
+        self.assertEqual(len(history_calls), 1)
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_missing_sample_id_yields_unknown_not_a_crash(self, mock_get, mock_paginated):
+        """A result with no sample id still gets a verdict block."""
+        mock_get.side_effect = [
+            {'run_id': 9299, 'platform': 'windows', 'status': 'fail'},
+            {'run_id': 9299, 'total_samples': 1, 'pass_count': 0, 'fail_count': 1},
+        ]
+        mock_paginated.return_value = [
+            {'regression_test_id': 18, 'sample_id': None, 'sample_name': 'orphan',
+             'categories': [], 'status': 'fail', 'exit_code': 1, 'expected_rc': 0, 'outputs': []},
+        ]
+        result = self.runner.invoke(cli, ['investigate', '9299', '--with-history'])
+
+        self.assertEqual(result.exit_code, 0)
+        report = json.loads(result.output)
+        self.assertEqual(report['failures'][0]['history']['verdict'], 'UNKNOWN')
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_table_output_lifts_the_verdict_into_a_column(self, mock_get, mock_paginated):
+        """The nested block is right for JSON and wrong for a table cell."""
+        result = self._invoke(mock_get, mock_paginated,
+                              ['-o', 'table', 'investigate', '9299', '--with-history'],
+                              {42: self._history_for(18), 43: self._history_for(137)})
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn('verdict', result.output)
+        self.assertIn('NEW_REGRESSION', result.output)
+        self.assertIn('by history:', result.output)
+        self.assertNotIn("{'verdict'", result.output)
+
+
 class ApiContractTests(unittest.TestCase):
     """Pin the CLI surface to what the merged ``mod_api`` blueprint actually accepts.
 
