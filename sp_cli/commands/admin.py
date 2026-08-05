@@ -9,7 +9,8 @@ from typing import Optional
 import click
 
 from sp_cli.constants import (BLOCKED_USER_COMMENT_MAX_LENGTH,
-                              EXTENSION_MAX_LENGTH, PLATFORMS)
+                              EXTENSION_MAX_LENGTH, MAX_OFFSET, MAX_PAGE_LIMIT,
+                              PLATFORMS)
 from sp_cli.runner import clean_params, fetch_and_render, send_and_render
 
 
@@ -56,8 +57,10 @@ def blocked_users() -> None:
 
 
 @blocked_users.command('ls')
-@click.option('--limit', type=int, default=None, help='Page size (max 100).')
-@click.option('--offset', type=int, default=None, help='Pagination offset.')
+@click.option('--limit', type=click.IntRange(1, MAX_PAGE_LIMIT), default=None,
+              help=f'Page size (1-{MAX_PAGE_LIMIT}).')
+@click.option('--offset', type=click.IntRange(0, MAX_OFFSET), default=None,
+              help='Pagination offset.')
 @click.pass_context
 def blocked_users_ls(ctx: click.Context, limit: Optional[int], offset: Optional[int]) -> None:
     """List the GitHub accounts blocked from triggering CI runs."""
@@ -99,8 +102,10 @@ def forbidden_extensions() -> None:
 
 
 @forbidden_extensions.command('ls')
-@click.option('--limit', type=int, default=None, help='Page size (max 100).')
-@click.option('--offset', type=int, default=None, help='Pagination offset.')
+@click.option('--limit', type=click.IntRange(1, MAX_PAGE_LIMIT), default=None,
+              help=f'Page size (1-{MAX_PAGE_LIMIT}).')
+@click.option('--offset', type=click.IntRange(0, MAX_OFFSET), default=None,
+              help='Pagination offset.')
 @click.pass_context
 def forbidden_extensions_ls(ctx: click.Context, limit: Optional[int],
                             offset: Optional[int]) -> None:

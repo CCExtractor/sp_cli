@@ -6,8 +6,8 @@ import click
 
 from sp_cli import config
 from sp_cli.client import ApiError
-from sp_cli.constants import (TOKEN_MAX_DAYS, TOKEN_MIN_DAYS, TOKEN_SCOPES,
-                              USER_ROLES)
+from sp_cli.constants import (MAX_OFFSET, MAX_PAGE_LIMIT, TOKEN_MAX_DAYS,
+                              TOKEN_MIN_DAYS, TOKEN_SCOPES, USER_ROLES)
 from sp_cli.output import render, render_error
 from sp_cli.runner import clean_params, fetch_and_render, send_and_render
 
@@ -61,8 +61,10 @@ def auth_login(ctx: click.Context, email: str, password: str, token_name: str,
 
 
 @auth.command('tokens')
-@click.option('--limit', type=int, default=None, help='Page size (max 100).')
-@click.option('--offset', type=int, default=None, help='Pagination offset.')
+@click.option('--limit', type=click.IntRange(1, MAX_PAGE_LIMIT), default=None,
+              help=f'Page size (1-{MAX_PAGE_LIMIT}).')
+@click.option('--offset', type=click.IntRange(0, MAX_OFFSET), default=None,
+              help='Pagination offset.')
 @click.pass_context
 def auth_tokens(ctx: click.Context, limit: Optional[int], offset: Optional[int]) -> None:
     """List this account's API tokens (metadata only, never the token itself)."""
@@ -86,7 +88,11 @@ def auth_revoke(ctx: click.Context, token_id: int) -> None:
     except ApiError as error:
         render_error(error, output)
         raise SystemExit(error.exit_code)
-    click.echo(f'Token {token_id} revoked.')
+    # The API answers 204 with no body, so the result is synthesized -- but it
+    # is still rendered, because every other command emits JSON on stdout and a
+    # bare English sentence breaks anything piping this into jq. The shape
+    # mirrors the API's own deletes, which answer {id, deleted}.
+    render({'token_id': token_id, 'revoked': True}, output, ctx.obj.get('color', False))
 
 
 @auth.command('logout')
@@ -94,19 +100,34 @@ def auth_revoke(ctx: click.Context, token_id: int) -> None:
 def auth_logout(ctx: click.Context) -> None:
     """Revoke the current API token and drop the saved session.
 
-    The local file is cleared even if the server call fails, so a token that
-    was already revoked or expired cannot leave a stale credential on disk.
+    The saved file is only cleared when the token being revoked is the saved
+    one. Revoking a scratch token passed via --token or SP_API_TOKEN leaves an
+    unrelated saved session alone -- deleting it would be unrecoverable, since
+    the plaintext token is returned only once at creation.
+
+    If the server rejects the token as dead (401/403) the saved copy is cleared
+    too, since it cannot work again. A connection failure leaves it in place:
+    the token may still be perfectly good and only the network was at fault.
     """
     client = ctx.obj['client']
     output = ctx.obj['output']
+
+    # Compared by value rather than tracking provenance, so passing --token
+    # with the same value as the saved session still clears it correctly.
+    saved = config.saved_token()
+    revoking_saved = saved is not None and saved == client.token
+
     try:
         client.request('DELETE', '/auth/tokens/current')
     except ApiError as error:
-        config.clear_token()
+        if revoking_saved and error.status in (401, 403):
+            config.clear_token()
         render_error(error, output)
         raise SystemExit(error.exit_code)
-    cleared = config.clear_token()
-    click.echo('Token revoked.' + (' Saved session cleared.' if cleared else ''))
+
+    cleared = bool(revoking_saved and config.clear_token())
+    render({'revoked': True, 'saved_session_cleared': cleared},
+           output, ctx.obj.get('color', False))
 
 
 @auth.command('whoami')
@@ -121,8 +142,10 @@ def auth_whoami(ctx: click.Context) -> None:
 
 
 @auth.command('users')
-@click.option('--limit', type=int, default=None, help='Page size (max 100).')
-@click.option('--offset', type=int, default=None, help='Pagination offset.')
+@click.option('--limit', type=click.IntRange(1, MAX_PAGE_LIMIT), default=None,
+              help=f'Page size (1-{MAX_PAGE_LIMIT}).')
+@click.option('--offset', type=click.IntRange(0, MAX_OFFSET), default=None,
+              help='Pagination offset.')
 @click.pass_context
 def auth_users(ctx: click.Context, limit: Optional[int], offset: Optional[int]) -> None:
     """List platform users, oldest first (admin only).

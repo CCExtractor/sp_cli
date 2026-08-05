@@ -61,12 +61,39 @@ def saved_token() -> Optional[str]:
     return token if isinstance(token, str) and token else None
 
 
+def _write_private(path: Path, data: Dict[str, Any]) -> None:
+    """
+    Write JSON to ``path`` with owner-only permissions in force before any bytes land.
+
+    ``os.open``'s mode argument only applies when the file is *created*; an
+    existing file keeps whatever permissions it already had. Writing first and
+    ``chmod``-ing afterwards therefore leaves a window in which a fresh token
+    sits in a still-world-readable file. Tightening the open descriptor with
+    ``fchmod`` before writing closes that window, and works on the descriptor so
+    there is no path-swap race either.
+
+    :param path: The file to write.
+    :type path: Path
+    :param data: The mapping to serialize.
+    :type data: Dict[str, Any]
+    """
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _FILE_MODE)
+    with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+        if hasattr(os, 'fchmod'):
+            os.fchmod(handle.fileno(), _FILE_MODE)
+        json.dump(data, handle, indent=2)
+        handle.write('\n')
+    if not hasattr(os, 'fchmod'):  # Windows: no descriptor-level chmod available.
+        os.chmod(path, _FILE_MODE)
+
+
 def save_token(token: str, base_url: Optional[str] = None) -> Path:
     """
     Persist a token (and optionally the base URL it belongs to) at mode 0600.
 
-    The file is created with restrictive permissions from the outset rather
-    than chmod-ed afterwards, so the secret is never briefly world-readable.
+    The permissions are tightened before the token is written, so the secret is
+    never briefly world-readable -- including on re-login, when the file already
+    exists and ``os.open``'s creation mode would be ignored.
 
     :param token: The plaintext bearer token to store.
     :type token: str
@@ -83,13 +110,7 @@ def save_token(token: str, base_url: Optional[str] = None) -> Path:
     if base_url:
         data['base_url'] = base_url
 
-    # Open through os.open so the mode applies at creation time. An existing
-    # file keeps its inode, so re-chmod it too.
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _FILE_MODE)
-    with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
-        json.dump(data, handle, indent=2)
-        handle.write('\n')
-    os.chmod(path, _FILE_MODE)
+    _write_private(path, data)
     return path
 
 
@@ -113,10 +134,7 @@ def clear_token() -> bool:
             return False
         return True
 
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _FILE_MODE)
-    with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
-        json.dump(data, handle, indent=2)
-        handle.write('\n')
+    _write_private(path, data)
     return True
 
 

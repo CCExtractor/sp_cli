@@ -276,8 +276,16 @@ class InvestigateHistoryTests(unittest.TestCase):
 
     @mock.patch('sp_cli.client.ApiClient.get_paginated')
     @mock.patch('sp_cli.client.ApiClient.get')
-    def test_history_depth_implies_the_flag_and_sets_the_page_size(self, mock_get, mock_paginated):
-        """--history-depth alone turns history on, and asks for depth + the current run."""
+    def test_history_depth_implies_the_flag_and_asks_for_a_full_page(self, mock_get, mock_paginated):
+        """--history-depth alone turns history on; the page size is always the maximum.
+
+        Sizing the page to depth + 1 looked right but delivered a fraction of
+        it: the endpoint returns entries for every regression test on the
+        sample and slices only afterwards, so the window has to be filtered
+        client-side out of as large a page as the API will give.
+        """
+        from sp_cli.constants import MAX_PAGE_LIMIT
+
         result = self._invoke(mock_get, mock_paginated,
                               ['investigate', '9299', '--history-depth', '5'],
                               {42: self._history_for(18), 43: self._history_for(137)})
@@ -285,8 +293,8 @@ class InvestigateHistoryTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertIn('by_verdict', json.loads(result.output))
         history_call = next(c for c in mock_paginated.call_args_list if '/history' in c.args[0])
-        self.assertEqual(history_call.kwargs['params']['limit'], 6)
-        self.assertEqual(history_call.kwargs['max_items'], 6)
+        self.assertEqual(history_call.kwargs['params']['limit'], MAX_PAGE_LIMIT)
+        self.assertEqual(history_call.kwargs['max_items'], MAX_PAGE_LIMIT)
 
     @mock.patch('sp_cli.client.ApiClient.get_paginated')
     @mock.patch('sp_cli.client.ApiClient.get')
@@ -472,9 +480,12 @@ class ApiContractTests(unittest.TestCase):
     def test_auth_login_sends_scopes_only_when_requested(self, mock_request):
         """Omitting --scope leaves the field out so the server picks its default set."""
         mock_request.return_value = {'token': 'spci_x', 'token_name': 'sp-cli', 'scopes': []}
+        # --no-save: this asserts the request body, not the saved session. The
+        # conftest fixture makes it safe either way, but saying so locally keeps
+        # the next reader from wondering whether the write is intentional.
         result = self.runner.invoke(cli, ['auth', 'login', '--email', 'a@b.co',
                                           '--password', 'hunter22', '--scope', 'runs:read',
-                                          '--scope', 'results:read'])
+                                          '--scope', 'results:read', '--no-save'])
 
         self.assertEqual(result.exit_code, 0)
         body = mock_request.call_args.kwargs['json_body']
@@ -1080,3 +1091,274 @@ class HistoryDegradationTests(unittest.TestCase):
         result = self.runner.invoke(cli, ['investigate', '1', '--with-history'])
 
         self.assertEqual(result.exit_code, 4)
+
+
+class HistoryDegradationOrderingTests(unittest.TestCase):
+    """The three interacting defects in the history circuit breaker.
+
+    Each of these passed the original implementation's own tests, because those
+    only exercised one failing sample at a time.
+    """
+
+    def setUp(self):
+        """Create a runner for each test."""
+        self.runner = CliRunner()
+
+    RUN = {'run_id': 9388, 'platform': 'linux', 'status': 'fail'}
+    SUMMARY = {'fail_count': 4, 'total_samples': 4, 'pass_count': 0}
+
+    @staticmethod
+    def _rows(*pairs):
+        """Build failure rows as (sample_id, regression_test_id) pairs."""
+        return [{'sample_id': s, 'regression_test_id': r, 'sample_name': f's{s}',
+                 'categories': [], 'status': 'fail', 'exit_code': 1,
+                 'expected_rc': 0, 'outputs': []} for s, r in pairs]
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_one_bad_sample_does_not_trip_the_breaker(self, mock_get, mock_paginated):
+        """A failure is remembered per sample, so shared samples are asked once."""
+        # Sample 50 has three regression tests and is unreachable; 60 is fine.
+        rows = self._rows((50, 1), (50, 2), (50, 3), (60, 4))
+        mock_get.side_effect = [self.RUN, self.SUMMARY]
+        mock_paginated.side_effect = [
+            rows,
+            ApiError('connection_error', 'Read timed out.'),
+            [],  # sample 60 resolves normally
+        ]
+        result = self.runner.invoke(cli, ['investigate', '9388', '--with-history'])
+
+        self.assertEqual(result.exit_code, 0)
+        report = json.loads(result.stdout)
+        # Sample 50 asked once, not three times: 1 samples call + 2 history calls.
+        self.assertEqual(mock_paginated.call_count, 3)
+        self.assertFalse(report['history_incomplete']['gave_up'])
+        self.assertEqual(report['history_incomplete']['failed_samples'], [50])
+        # Sample 60 still got a real verdict.
+        self.assertNotEqual(report['failures'][3]['history']['verdict'], 'UNKNOWN')
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_giving_up_still_uses_history_already_in_hand(self, mock_get, mock_paginated):
+        """A sample fetched successfully is classified even after the breaker trips."""
+        # 42 succeeds first; 60/61/62 then fail and trip the breaker; 42 recurs.
+        rows = self._rows((42, 1), (60, 2), (61, 3), (62, 4), (42, 5))
+        mock_get.side_effect = [self.RUN, self.SUMMARY]
+        mock_paginated.side_effect = [
+            rows,
+            [],  # sample 42 ok
+            ApiError('connection_error', 'boom'),
+            ApiError('connection_error', 'boom'),
+            ApiError('connection_error', 'boom'),
+        ]
+        result = self.runner.invoke(cli, ['investigate', '9388', '--with-history'])
+
+        self.assertEqual(result.exit_code, 0)
+        report = json.loads(result.stdout)
+        self.assertTrue(report['history_incomplete']['gave_up'])
+        # The second row for sample 42 is classified from cache, not skipped.
+        last = report['failures'][4]['history']
+        self.assertNotEqual(last['verdict'], 'UNKNOWN')
+        self.assertNotIn('not responding', str(last.get('reason', '')))
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_failed_samples_are_not_listed_twice(self, mock_get, mock_paginated):
+        """One unreachable sample appears once in the report, however many rows it has."""
+        rows = self._rows((50, 1), (50, 2), (50, 3))
+        mock_get.side_effect = [self.RUN, self.SUMMARY]
+        mock_paginated.side_effect = [rows, ApiError('connection_error', 'boom')]
+        result = self.runner.invoke(cli, ['investigate', '9388', '--with-history'])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(
+            json.loads(result.stdout)['history_incomplete']['failed_samples'], [50])
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    def test_history_depth_is_bounded_by_the_api_page_limit(self, mock_paginated):
+        """limit = depth + 1 must stay <= 100, or every lookup 400s."""
+        for bad in ('100', '500', '0', '-1'):
+            result = self.runner.invoke(cli, ['investigate', '9388', '--history-depth', bad])
+            self.assertNotEqual(result.exit_code, 0, f'--history-depth {bad} should be rejected')
+        mock_paginated.assert_not_called()
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_the_largest_accepted_depth_still_fits_the_page(self, mock_get, mock_paginated):
+        """depth 99 sends limit 100, which is exactly the API's ceiling."""
+        mock_get.side_effect = [self.RUN, self.SUMMARY]
+        mock_paginated.side_effect = [self._rows((42, 1)), []]
+        result = self.runner.invoke(cli, ['investigate', '9388', '--history-depth', '99'])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(mock_paginated.call_args.kwargs['params']['limit'], 100)
+
+
+class TruncatedOutputTests(unittest.TestCase):
+    """`--decode` must not write a file that ends mid-stream and looks complete.
+
+    The API inlines at most 1 MiB and flags the rest as truncated; writing the
+    fragment made every diff against it report spurious missing lines.
+    """
+
+    def setUp(self):
+        """Create a runner for each test."""
+        self.runner = CliRunner()
+
+    DETAIL = {'sample_id': 11, 'regression_test_id': 11,
+              'outputs': [{'output_id': 11, 'status': 'fail'}]}
+
+    BIG = {'content': 'dHJ1bmNhdGVk', 'encoding': 'base64', 'truncated': True,
+           'sha256': 'abc123', 'download_url': 'https://storage.example/whole-file'}
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_a_truncated_output_is_refused_not_silently_written(self, mock_get):
+        """Nothing reaches stdout, and the error names where to get the whole file."""
+        mock_get.side_effect = [self.DETAIL, self.BIG]
+        result = self.runner.invoke(cli, ['run', 'output', '9388', '11', '--decode'])
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertEqual(result.stdout_bytes, b'')
+        envelope = json.loads(result.stderr)
+        self.assertEqual(envelope['error']['code'], 'output_truncated')
+        self.assertEqual(envelope['error']['details']['download_url'],
+                         'https://storage.example/whole-file')
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_allow_truncated_opts_in_explicitly(self, mock_get):
+        """The capability is kept, but you have to ask for it by name."""
+        mock_get.side_effect = [self.DETAIL, self.BIG]
+        result = self.runner.invoke(
+            cli, ['run', 'output', '9388', '11', '--decode', '--allow-truncated'])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.stdout_bytes, b'truncated')
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_a_complete_output_is_unaffected(self, mock_get):
+        """The ordinary path still writes the file."""
+        mock_get.side_effect = [
+            self.DETAIL,
+            {'content': 'aGVsbG8=', 'encoding': 'base64', 'truncated': False},
+        ]
+        result = self.runner.invoke(cli, ['run', 'output', '9388', '11', '--decode'])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.stdout_bytes, b'hello')
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_a_missing_truncated_key_is_treated_as_complete(self, mock_get):
+        """Older responses without the field must not start failing."""
+        mock_get.side_effect = [self.DETAIL, {'content': 'aGk=', 'encoding': 'base64'}]
+        result = self.runner.invoke(cli, ['run', 'output', '9388', '11', '--decode'])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.stdout_bytes, b'hi')
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_the_json_envelope_still_shows_truncation(self, mock_get):
+        """Without --decode the flag is visible to the caller as data."""
+        mock_get.side_effect = [self.DETAIL, self.BIG]
+        result = self.runner.invoke(cli, ['run', 'output', '9388', '11'])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertTrue(json.loads(result.stdout)['truncated'])
+
+
+class MachineOutputContractTests(unittest.TestCase):
+    """Every command's stdout must be parseable JSON in the default mode.
+
+    `auth revoke` and `auth logout` printed bare English sentences, so piping
+    them into jq failed while every other command worked.
+    """
+
+    def setUp(self):
+        """Create a runner for each test."""
+        self.runner = CliRunner()
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_auth_revoke_emits_json(self, mock_request):
+        """`sp auth revoke 5 | jq .` must not choke on prose."""
+        mock_request.return_value = None
+        result = self.runner.invoke(cli, ['auth', 'revoke', '5'])
+
+        self.assertEqual(result.exit_code, 0)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload, {'token_id': 5, 'revoked': True})
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_auth_logout_emits_json(self, mock_request):
+        """Same for logout, including whether the saved session went with it."""
+        mock_request.return_value = None
+        result = self.runner.invoke(cli, ['auth', 'logout'])
+
+        self.assertEqual(result.exit_code, 0)
+        payload = json.loads(result.stdout)
+        self.assertIs(payload['revoked'], True)
+        self.assertIn('saved_session_cleared', payload)
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_no_command_leaks_prose_onto_stdout(self, mock_request):
+        """A sweep over the write commands that answer 204, which have no body to render."""
+        mock_request.return_value = None
+        for args in (['auth', 'revoke', '5'], ['auth', 'logout']):
+            result = self.runner.invoke(cli, args)
+            self.assertEqual(result.exit_code, 0, args)
+            try:
+                json.loads(result.stdout)
+            except ValueError:  # pragma: no cover - the assertion message is the point
+                self.fail(f'{args} wrote non-JSON to stdout: {result.stdout!r}')
+
+
+class PageLimitContractTests(unittest.TestCase):
+    """--limit and --offset are bounded by what the API's paginator accepts.
+
+    LOG_MAX_LIMIT mirrored a 1-500 clamp inside the log service, but
+    _parse_limit rejects anything over 100 first, so that clamp is unreachable
+    and the CLI advertised a page size the API refuses.
+    """
+
+    def setUp(self):
+        """Create a runner for each test."""
+        self.runner = CliRunner()
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_run_logs_limit_is_capped_at_the_paginator_ceiling(self, mock_get):
+        """The value the old help text advertised as legal is now rejected locally."""
+        result = self.runner.invoke(cli, ['run', 'logs', '9299', '--limit', '500'])
+
+        self.assertNotEqual(result.exit_code, 0)
+        mock_get.assert_not_called()
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_the_ceiling_itself_is_accepted(self, mock_get):
+        """100 is legal; 101 is not."""
+        mock_get.return_value = {'data': [], 'pagination': {}}
+        self.assertEqual(
+            self.runner.invoke(cli, ['run', 'logs', '9299', '--limit', '100']).exit_code, 0)
+        self.assertNotEqual(
+            self.runner.invoke(cli, ['run', 'logs', '9299', '--limit', '101']).exit_code, 0)
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_every_paginated_command_rejects_an_out_of_range_limit(self, mock_get):
+        """One shared rule, so it is checked across the surface rather than per command."""
+        commands = (
+            ['run', 'ls'], ['run', 'results', '9299'], ['run', 'errors', '9299'],
+            ['run', 'artifacts', '9299'], ['run', 'progress', '9299'],
+            ['sample', 'ls'], ['sample', 'history', '42'], ['regression', 'ls'],
+            ['category', 'ls'], ['auth', 'tokens'], ['auth', 'users'], ['queue'],
+            ['admin', 'blocked-users', 'ls'], ['admin', 'forbidden-extensions', 'ls'],
+        )
+        for cmd in commands:
+            for bad in ('0', '101'):
+                result = self.runner.invoke(cli, cmd + ['--limit', bad])
+                self.assertNotEqual(result.exit_code, 0, f'{cmd} --limit {bad} should be rejected')
+        mock_get.assert_not_called()
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_a_negative_offset_is_rejected(self, mock_get):
+        """The API 400s on a negative offset; fail locally instead."""
+        result = self.runner.invoke(cli, ['run', 'ls', '--offset', '-1'])
+
+        self.assertNotEqual(result.exit_code, 0)
+        mock_get.assert_not_called()

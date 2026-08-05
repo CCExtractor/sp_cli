@@ -163,3 +163,58 @@ class VerdictGroupingTests(unittest.TestCase):
         real = classify_history(entry(9299, 'fail'), [entry(9298, 'pass')])
 
         self.assertEqual(set(unknown_history('no id')), set(real))
+
+
+class TruncatedWindowTests(unittest.TestCase):
+    """NEVER_PASSED must not be asserted confidently on a window we could not see past.
+
+    /samples/{id}/history returns entries for every regression test on the
+    sample and slices only afterwards, so the window for one test is roughly
+    the page size divided by how many tests share the sample. A test that
+    passed nine runs ago looked like it had never passed at all.
+    """
+
+    @staticmethod
+    def _fails(*run_ids):
+        """Build failing prior entries, newest first."""
+        return [{'run_id': r, 'status': 'fail', 'regression_test_id': 1} for r in run_ids]
+
+    def test_a_short_window_downgrades_confidence(self):
+        """Same verdict for grouping, but not claimed as fact."""
+        block = classify_history(None, self._fails(98, 97), window_truncated=True)
+
+        self.assertEqual(block['verdict'], NEVER_PASSED)
+        self.assertEqual(block['confidence'], 'low')
+        self.assertTrue(block['window_truncated'])
+        self.assertIn('older runs could not be read', block['reason'])
+
+    def test_a_complete_window_still_asserts_it(self):
+        """When the window really is the whole history, the claim stands."""
+        block = classify_history(None, self._fails(98, 97), window_truncated=False)
+
+        self.assertEqual(block['verdict'], NEVER_PASSED)
+        self.assertEqual(block['confidence'], 'high')
+        self.assertFalse(block['window_truncated'])
+
+    def test_truncation_does_not_weaken_the_other_verdicts(self):
+        """NEW_REGRESSION and STILL_FAILING are decided by the newest entries, always present."""
+        passed_then_failed = [{'run_id': 98, 'status': 'pass', 'regression_test_id': 1}]
+        new = classify_history(None, passed_then_failed, window_truncated=True)
+        self.assertEqual(new['verdict'], NEW_REGRESSION)
+        self.assertEqual(new['confidence'], 'high')
+
+        with_a_pass = self._fails(98) + [{'run_id': 97, 'status': 'pass',
+                                          'regression_test_id': 1}]
+        still = classify_history(None, with_a_pass, window_truncated=True)
+        self.assertEqual(still['verdict'], STILL_FAILING)
+        self.assertEqual(still['confidence'], 'high')
+
+    def test_every_verdict_block_carries_the_flag(self):
+        """Uniform shape keeps the JSON safe to iterate over."""
+        blocks = [
+            classify_history(None, [], window_truncated=True),
+            classify_history(None, self._fails(98), window_truncated=True),
+            unknown_history('lookup failed'),
+        ]
+        for block in blocks:
+            self.assertIn('window_truncated', block, block['verdict'])

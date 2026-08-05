@@ -89,14 +89,23 @@ def _count_transitions(chronological: List[Dict[str, Any]]) -> int:
 
 
 def classify_history(current: Optional[Dict[str, Any]],
-                     prior: List[Dict[str, Any]]) -> Dict[str, Any]:
+                     prior: List[Dict[str, Any]],
+                     window_truncated: bool = False) -> Dict[str, Any]:
     """
     Decide whether a current failure is new, long-standing, never-working, or noise.
+
+    ``window_truncated`` says the caller could not see as far back as it asked
+    for. That only changes NEVER_PASSED: "has never passed" and "has not passed
+    within the few runs I could see" are different claims, and the second must
+    not be reported with high confidence. The other verdicts are unaffected --
+    they are decided by the most recent entries, which are always present.
 
     :param current: The current run's history entry, if it was found.
     :type current: Optional[Dict[str, Any]]
     :param prior: Entries for earlier runs, newest first.
     :type prior: List[Dict[str, Any]]
+    :param window_truncated: Whether older runs existed but could not be read.
+    :type window_truncated: bool
     :return: A verdict block with the supporting run ids and signature comparison.
     :rtype: Dict[str, Any]
     """
@@ -105,7 +114,8 @@ def classify_history(current: Optional[Dict[str, Any]],
         return {'verdict': NO_HISTORY, 'confidence': 'low',
                 'reason': 'No earlier run of this test to compare against',
                 'last_pass_run': None, 'previous_run': None, 'prior_runs_considered': 0,
-                'transitions': 0, 'signature': signature, 'signature_changed': None}
+                'transitions': 0, 'signature': signature, 'signature_changed': None,
+                'window_truncated': window_truncated}
 
     previous = prior[0]
     last_pass = next((e for e in prior if _is_pass(e)), None)
@@ -123,6 +133,7 @@ def classify_history(current: Optional[Dict[str, Any]],
         'transitions': transitions,
         'signature': signature,
         'signature_changed': signature_changed,
+        'window_truncated': window_truncated,
     }
 
     if transitions >= FLAKY_TRANSITION_THRESHOLD:
@@ -132,6 +143,12 @@ def classify_history(current: Optional[Dict[str, Any]],
     elif _is_pass(previous):
         block.update(verdict=NEW_REGRESSION, confidence='high',
                      reason=f"Passed in run {previous.get('run_id')}, fails here")
+    elif last_pass is None and window_truncated:
+        # Older runs exist but could not be read, so a pass may be just beyond
+        # the window. Reported as NEVER_PASSED for grouping, but not asserted.
+        block.update(verdict=NEVER_PASSED, confidence='low',
+                     reason=(f'Has not passed in the {len(prior)} runs visible here, but older '
+                             f'runs could not be read, so it may have passed before that'))
     elif last_pass is None:
         block.update(verdict=NEVER_PASSED, confidence='high',
                      reason=f'Has not passed in any of the last {len(prior)} runs')
@@ -156,7 +173,8 @@ def unknown_history(reason: str) -> Dict[str, Any]:
     """
     return {'verdict': UNKNOWN, 'confidence': 'low', 'reason': reason,
             'last_pass_run': None, 'previous_run': None, 'prior_runs_considered': 0,
-            'transitions': 0, 'signature': None, 'signature_changed': None}
+            'transitions': 0, 'signature': None, 'signature_changed': None,
+            'window_truncated': False}
 
 
 def group_by_verdict(failures: List[Dict[str, Any]]) -> Dict[str, int]:

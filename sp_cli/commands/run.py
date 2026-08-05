@@ -10,8 +10,8 @@ from sp_cli.client import ApiError
 from sp_cli.constants import (ARTIFACT_TYPES, CANCEL_REASON_MIN_LENGTH,
                               COMMIT_SHA_LENGTH, ERROR_GROUP_BY,
                               ERROR_SEVERITIES, ERROR_TYPES, INFRA_ERROR_TYPES,
-                              LOG_CONTAINS_MAX_LENGTH, LOG_LEVELS,
-                              LOG_MAX_LIMIT, LOG_SOURCES,
+                              LOG_CONTAINS_MAX_LENGTH, LOG_LEVELS, LOG_SOURCES,
+                              MAX_OFFSET, MAX_PAGE_LIMIT,
                               MAX_REGRESSION_TEST_IDS, PLATFORMS, RUN_STATUSES,
                               SAMPLE_STATUSES)
 from sp_cli.output import render, render_error
@@ -37,8 +37,10 @@ def run() -> None:
               help='Only runs first seen at/after this time (ISO 8601).')
 @click.option('--created-before', 'created_before', default=None,
               help='Only runs first seen at/before this time (ISO 8601).')
-@click.option('--limit', type=int, default=None, help='Page size (max 100).')
-@click.option('--offset', type=int, default=None, help='Pagination offset.')
+@click.option('--limit', type=click.IntRange(1, MAX_PAGE_LIMIT), default=None,
+              help=f'Page size (1-{MAX_PAGE_LIMIT}).')
+@click.option('--offset', type=click.IntRange(0, MAX_OFFSET), default=None,
+              help='Pagination offset.')
 @click.pass_context
 def run_ls(ctx: click.Context, status: Optional[str], platform: Optional[str], branch: Optional[str],
            commit_sha: Optional[str], repository: Optional[str], sort: Optional[str],
@@ -137,8 +139,10 @@ def run_failures(ctx: click.Context, run_id: int) -> None:
 @click.option('--name', default=None, help='Substring match on the sample name.')
 @click.option('--tag', default=None, help='Filter by sample tag.')
 @click.option('--category', default=None, help='Filter by regression-test category.')
-@click.option('--limit', type=int, default=None, help='Page size (max 100).')
-@click.option('--offset', type=int, default=None, help='Pagination offset.')
+@click.option('--limit', type=click.IntRange(1, MAX_PAGE_LIMIT), default=None,
+              help=f'Page size (1-{MAX_PAGE_LIMIT}).')
+@click.option('--offset', type=click.IntRange(0, MAX_OFFSET), default=None,
+              help='Pagination offset.')
 @click.pass_context
 def run_results(ctx: click.Context, run_id: int, status: Optional[str], name: Optional[str],
                 tag: Optional[str], category: Optional[str],
@@ -241,8 +245,10 @@ def run_approve_baseline(ctx: click.Context, run_id: int, sample_id: int,
 
 @run.command('progress')
 @click.argument('run_id', type=int)
-@click.option('--limit', type=int, default=None, help='Page size (max 100).')
-@click.option('--offset', type=int, default=None, help='Pagination offset.')
+@click.option('--limit', type=click.IntRange(1, MAX_PAGE_LIMIT), default=None,
+              help=f'Page size (1-{MAX_PAGE_LIMIT}).')
+@click.option('--offset', type=click.IntRange(0, MAX_OFFSET), default=None,
+              help='Pagination offset.')
 @click.pass_context
 def run_progress(ctx: click.Context, run_id: int, limit: Optional[int],
                  offset: Optional[int]) -> None:
@@ -296,9 +302,13 @@ def run_cancel(ctx: click.Context, run_id: int, reason: Optional[str]) -> None:
 @click.option('--format', 'fmt', default=None, help='Response format accepted by the API.')
 @click.option('--decode', is_flag=True, default=False,
               help='Write the decoded file to stdout instead of the JSON envelope.')
+@click.option('--allow-truncated', is_flag=True, default=False,
+              help='With --decode, write the first 1 MiB of an oversized output '
+                   'instead of refusing it. The file will be incomplete.')
 @click.pass_context
 def run_output(ctx: click.Context, run_id: int, sample_id: int, regression_id: Optional[int],
-               output_id: Optional[int], side: str, fmt: Optional[str], decode: bool) -> None:
+               output_id: Optional[int], side: str, fmt: Optional[str], decode: bool,
+               allow_truncated: bool) -> None:
     """Fetch one side of a result's output file.
 
     Resolves the (media sample, regression, output) ids the same way `sp run
@@ -326,7 +336,7 @@ def run_output(ctx: click.Context, run_id: int, sample_id: int, regression_id: O
             f'/regression-tests/{reg_id}/outputs/{out_id}/{side}',
             params=clean_params({'format': fmt}))
         if decode:
-            _write_decoded(payload)
+            _write_decoded(payload, allow_truncated)
             return
     except ApiError as error:
         render_error(error, output)
@@ -334,7 +344,7 @@ def run_output(ctx: click.Context, run_id: int, sample_id: int, regression_id: O
     render(payload, output)
 
 
-def _write_decoded(payload: Any) -> None:
+def _write_decoded(payload: Any, allow_truncated: bool = False) -> None:
     """
     Write an output envelope's file content to stdout as raw bytes.
 
@@ -342,17 +352,36 @@ def _write_decoded(payload: Any) -> None:
     byte-for-byte: these are subtitle files that may carry CRLF line endings
     and a non-UTF-8 encoding, and re-encoding them would corrupt a diff.
 
+    The API inlines at most 1 MiB and sets ``truncated`` beyond that. Writing
+    the fragment anyway would produce a file that ends mid-stream but looks
+    complete, and every diff run against it would report spurious missing lines
+    at the end -- so it is refused unless explicitly allowed. The envelope's
+    ``sha256`` is computed over the whole file, so a truncated write cannot even
+    be checked against it.
+
     :param payload: The decoded output envelope from the API.
     :type payload: Any
-    :raises ApiError: when the envelope carries no inline content.
+    :param allow_truncated: Write the partial content instead of refusing it.
+    :type allow_truncated: bool
+    :raises ApiError: when there is no inline content, or it is incomplete.
     """
     content = payload.get('content') if isinstance(payload, dict) else None
+    download_url = payload.get('download_url') if isinstance(payload, dict) else None
     if content is None:
         raise ApiError(
             'no_content',
             'This output has no inline content to decode; '
             'fetch it from download_url instead.', 404,
-            {'download_url': payload.get('download_url') if isinstance(payload, dict) else None})
+            {'download_url': download_url})
+
+    if payload.get('truncated') and not allow_truncated:
+        raise ApiError(
+            'output_truncated',
+            'This output exceeds the API\'s 1 MiB inline limit, so decoding it '
+            'would write an incomplete file. Download the whole file from '
+            'download_url, or pass --allow-truncated to write the first 1 MiB.',
+            None,
+            {'download_url': download_url, 'sha256': payload.get('sha256')})
 
     if (payload.get('encoding') or '').lower() == 'base64':
         data = base64.b64decode(content)
@@ -371,8 +400,10 @@ def _write_decoded(payload: Any) -> None:
 @click.argument('run_id', type=int)
 @click.option('--type', 'artifact_type', type=click.Choice(ARTIFACT_TYPES), default=None,
               help='Filter by artifact type.')
-@click.option('--limit', type=int, default=None, help='Page size (max 100).')
-@click.option('--offset', type=int, default=None, help='Pagination offset.')
+@click.option('--limit', type=click.IntRange(1, MAX_PAGE_LIMIT), default=None,
+              help=f'Page size (1-{MAX_PAGE_LIMIT}).')
+@click.option('--offset', type=click.IntRange(0, MAX_OFFSET), default=None,
+              help='Pagination offset.')
 @click.pass_context
 def run_artifacts(ctx: click.Context, run_id: int, artifact_type: Optional[str],
                   limit: Optional[int], offset: Optional[int]) -> None:
@@ -395,8 +426,8 @@ def run_artifacts(ctx: click.Context, run_id: int, artifact_type: Optional[str],
               help='Keep lines from this component.')
 @click.option('--contains', default=None,
               help=f'Case-insensitive substring filter (max {LOG_CONTAINS_MAX_LENGTH} chars).')
-@click.option('--limit', type=int, default=None,
-              help=f'Lines per page (max {LOG_MAX_LIMIT}, default 100).')
+@click.option('--limit', type=click.IntRange(1, MAX_PAGE_LIMIT), default=None,
+              help=f'Lines per page (1-{MAX_PAGE_LIMIT}, default 100).')
 @click.option('--cursor', default=None, help='Resume from a previous response\'s next_cursor.')
 @click.option('--all', 'fetch_all', is_flag=True, default=False,
               help='Follow next_cursor and return the whole log at once.')
@@ -449,8 +480,10 @@ def run_logs(ctx: click.Context, run_id: int, level: Optional[str], source: Opti
               help='Filter by severity. Test errors are only error or warning.')
 @click.option('--sample', 'sample_id', type=int, default=None,
               help='Restrict to one media sample id.')
-@click.option('--limit', type=int, default=None, help='Page size (max 100).')
-@click.option('--offset', type=int, default=None, help='Pagination offset.')
+@click.option('--limit', type=click.IntRange(1, MAX_PAGE_LIMIT), default=None,
+              help=f'Page size (1-{MAX_PAGE_LIMIT}).')
+@click.option('--offset', type=click.IntRange(0, MAX_OFFSET), default=None,
+              help='Pagination offset.')
 @click.pass_context
 def run_errors(ctx: click.Context, run_id: int, error_type: Optional[str],
                severity: Optional[str], sample_id: Optional[int],
@@ -472,8 +505,10 @@ def run_errors(ctx: click.Context, run_id: int, error_type: Optional[str],
               help='Bucket key. The API defaults to type.')
 @click.option('--severity', type=click.Choice(ERROR_SEVERITIES), default=None,
               help='Keep only buckets at this severity.')
-@click.option('--limit', type=int, default=None, help='Page size (max 100).')
-@click.option('--offset', type=int, default=None, help='Pagination offset.')
+@click.option('--limit', type=click.IntRange(1, MAX_PAGE_LIMIT), default=None,
+              help=f'Page size (1-{MAX_PAGE_LIMIT}).')
+@click.option('--offset', type=click.IntRange(0, MAX_OFFSET), default=None,
+              help='Pagination offset.')
 @click.pass_context
 def run_error_summary(ctx: click.Context, run_id: int, group_by: Optional[str],
                       severity: Optional[str], limit: Optional[int],
@@ -497,8 +532,10 @@ def run_error_summary(ctx: click.Context, run_id: int, group_by: Optional[str],
               help='Filter by severity. These are always reported as critical.')
 @click.option('--include-stack', is_flag=True, default=False,
               help='Include stack traces (admin or contributor only; 403 otherwise).')
-@click.option('--limit', type=int, default=None, help='Page size (max 100).')
-@click.option('--offset', type=int, default=None, help='Pagination offset.')
+@click.option('--limit', type=click.IntRange(1, MAX_PAGE_LIMIT), default=None,
+              help=f'Page size (1-{MAX_PAGE_LIMIT}).')
+@click.option('--offset', type=click.IntRange(0, MAX_OFFSET), default=None,
+              help='Pagination offset.')
 @click.pass_context
 def run_infra_errors(ctx: click.Context, run_id: int, error_type: Optional[str],
                      severity: Optional[str], include_stack: bool,

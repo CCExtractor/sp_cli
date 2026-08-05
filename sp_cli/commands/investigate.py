@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 import click
 
 from sp_cli.client import ApiError
+from sp_cli.constants import MAX_PAGE_LIMIT
 from sp_cli.history import (NEW_REGRESSION, classify_history, group_by_verdict,
                             split_history, unknown_history)
 from sp_cli.output import render, render_error
@@ -28,9 +29,9 @@ DEFAULT_HISTORY_DEPTH = 20
 @click.argument('run_id', type=int)
 @click.option('--with-history', 'with_history', is_flag=True, default=False,
               help='Label each failure as a new regression, long-standing, or never-passing.')
-@click.option('--history-depth', type=int, default=None,
-              help=f'Prior runs to weigh per failure (default: {DEFAULT_HISTORY_DEPTH}). '
-                   'Implies --with-history.')
+@click.option('--history-depth', type=click.IntRange(1, MAX_PAGE_LIMIT - 1), default=None,
+              help=f'Prior runs to weigh per failure (default: {DEFAULT_HISTORY_DEPTH}, '
+                   f'max {MAX_PAGE_LIMIT - 1}). Implies --with-history.')
 @click.pass_context
 def investigate(ctx: click.Context, run_id: int, with_history: bool,
                 history_depth: Optional[int]) -> None:
@@ -111,9 +112,13 @@ def _attach_history(client: Any, failures: List[Dict[str, Any]], run_id: int,
     :rtype: Optional[Dict[str, Any]]
     """
     cache: Dict[int, List[Dict[str, Any]]] = {}
+    # Failures are remembered per sample too. Several regression tests share one
+    # sample, so without this a single unreachable sample is re-fetched once per
+    # row -- paying the timeout again each time and counting itself repeatedly
+    # toward the breaker, which then trips on one sample rather than three.
+    failed: Dict[int, str] = {}
     consecutive_failures = 0
     given_up = False
-    failed_samples: List[int] = []
     last_error: Optional[str] = None
 
     for failure in failures:
@@ -122,35 +127,54 @@ def _attach_history(client: Any, failures: List[Dict[str, Any]], run_id: int,
             failure['history'] = unknown_history('Result has no sample id to look up')
             continue
 
-        if given_up:
-            failure['history'] = unknown_history(
-                'Skipped: the history endpoint is not responding')
+        if sample_id in failed:
+            failure['history'] = unknown_history(f'History lookup failed: {failed[sample_id]}')
             continue
 
         if sample_id not in cache:
-            # +1 so the current run's own entry cannot displace an older one.
-            params = clean_params({'platform': platform, 'limit': depth + 1})
+            # Checked here rather than at the top of the loop: giving up must
+            # only stop *new* requests. A sample already fetched successfully
+            # can still be classified from memory.
+            if given_up:
+                failure['history'] = unknown_history(
+                    'Skipped: the history endpoint is not responding')
+                continue
+
+            # A full page, not depth + 1. The endpoint returns entries for
+            # *every* regression test defined on the sample and slices only
+            # afterwards, so a page of N covers roughly N/(tests on this sample)
+            # runs of the one test being investigated -- asking for depth + 1
+            # silently delivered a fraction of it. Requesting the maximum costs
+            # the server nothing today, because it loads the sample's whole
+            # history and paginates in Python either way (sample-platform#1161).
+            params = clean_params({'platform': platform, 'limit': MAX_PAGE_LIMIT})
             try:
                 cache[sample_id] = client.get_paginated(
-                    f'/samples/{sample_id}/history', params=params, max_items=depth + 1)
+                    f'/samples/{sample_id}/history', params=params,
+                    max_items=MAX_PAGE_LIMIT)
                 consecutive_failures = 0
             except ApiError as error:
                 consecutive_failures += 1
                 last_error = error.message
-                failed_samples.append(sample_id)
+                failed[sample_id] = error.code
                 failure['history'] = unknown_history(f'History lookup failed: {error.code}')
                 if consecutive_failures >= _HISTORY_FAILURE_LIMIT:
                     given_up = True
                 continue
 
-        current, prior = split_history(cache[sample_id], run_id,
-                                       failure.get('regression_test_id'))
-        failure['history'] = classify_history(current, prior[:depth])
+        entries = cache[sample_id]
+        current, prior = split_history(entries, run_id, failure.get('regression_test_id'))
+        # A saturated page means the sample's history continues past what was
+        # read, so a window shorter than requested is a limit of the read rather
+        # than of the test's actual history. NEVER_PASSED must not be asserted
+        # confidently on that basis.
+        truncated = len(entries) >= MAX_PAGE_LIMIT and len(prior) < depth
+        failure['history'] = classify_history(current, prior[:depth], truncated)
 
-    if not failed_samples:
+    if not failed:
         return None
     return {
-        'failed_samples': failed_samples,
+        'failed_samples': sorted(failed),
         'gave_up': given_up,
         'reason': last_error,
     }

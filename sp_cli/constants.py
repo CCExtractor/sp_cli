@@ -40,6 +40,15 @@ TOKEN_MAX_SCOPES = len(TOKEN_SCOPES)
 #: ``POST /runs/{id}/cancel`` rejects a reason shorter than this.
 CANCEL_REASON_MIN_LENGTH = 5
 
+#: ``mod_api.middleware.validation._parse_limit`` 400s on ``limit < 1 or
+#: limit > 100``, for both the offset and cursor paginators. This is the real
+#: ceiling on every ``--limit``; a service-level clamp behind it is unreachable.
+MAX_PAGE_LIMIT = 100
+
+#: ``validate_offset_pagination`` rejects a negative offset and anything above
+#: this (a signed 32-bit maximum).
+MAX_OFFSET = 2147483647
+
 #: ``GET /runs/{id}/errors`` — the types ``derive_errors_for_run`` can emit.
 #: Test errors are derived from result rows, not stored, so this is the closed set.
 ERROR_TYPES = ('exit_code_mismatch', 'missing_output', 'diff_mismatch')
@@ -64,9 +73,6 @@ LOG_LEVELS = ('critical', 'error', 'warning', 'info', 'debug')
 
 #: ``GET /runs/{id}/logs`` — ``_extract_source`` keywords; unmatched lines are ``web``.
 LOG_SOURCES = ('orchestrator', 'worker', 'build', 'test_runner', 'web')
-
-#: ``read_log_lines`` clamps the page size into this range server-side.
-LOG_MAX_LIMIT = 500
 
 #: ``GET /runs/{id}/logs`` rejects a longer ``contains`` filter with a 400.
 LOG_CONTAINS_MAX_LENGTH = 100

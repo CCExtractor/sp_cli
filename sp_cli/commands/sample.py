@@ -4,8 +4,8 @@ from typing import Optional
 
 import click
 
-from sp_cli.constants import (PLATFORMS, SAMPLE_CATALOG_STATUSES,
-                              SAMPLE_STATUSES)
+from sp_cli.constants import (MAX_OFFSET, MAX_PAGE_LIMIT, PLATFORMS,
+                              SAMPLE_CATALOG_STATUSES, SAMPLE_STATUSES)
 from sp_cli.runner import clean_params, fetch_and_render
 
 
@@ -21,8 +21,10 @@ def sample() -> None:
 @click.option('--sha256', default=None, help='Filter by exact SHA-256 hash.')
 @click.option('--status', type=click.Choice(SAMPLE_CATALOG_STATUSES), default=None,
               help='Catalog visibility, not a test outcome.')
-@click.option('--limit', type=int, default=None, help='Page size (max 100).')
-@click.option('--offset', type=int, default=None, help='Pagination offset.')
+@click.option('--limit', type=click.IntRange(1, MAX_PAGE_LIMIT), default=None,
+              help=f'Page size (1-{MAX_PAGE_LIMIT}).')
+@click.option('--offset', type=click.IntRange(0, MAX_OFFSET), default=None,
+              help='Pagination offset.')
 @click.pass_context
 def sample_ls(ctx: click.Context, name: Optional[str], tag: Optional[str], extension: Optional[str],
               sha256: Optional[str], status: Optional[str],
@@ -64,8 +66,10 @@ def sample_details(ctx: click.Context, sample_id: int) -> None:
               help='Only runs first seen at/after this time (ISO 8601).')
 @click.option('--created-before', 'created_before', default=None,
               help='Only runs first seen at/before this time (ISO 8601).')
-@click.option('--limit', type=int, default=None, help='Page size (max 100).')
-@click.option('--offset', type=int, default=None, help='Pagination offset.')
+@click.option('--limit', type=click.IntRange(1, MAX_PAGE_LIMIT), default=None,
+              help=f'Page size (1-{MAX_PAGE_LIMIT}).')
+@click.option('--offset', type=click.IntRange(0, MAX_OFFSET), default=None,
+              help='Pagination offset.')
 @click.pass_context
 def sample_history(ctx: click.Context, sample_id: int, platform: Optional[str],
                    branch: Optional[str], status: Optional[str], created_after: Optional[str],

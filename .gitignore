@@ -21,3 +21,7 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
+
+# Claude Code's per-machine permission grants. Personal, not project policy,
+# and it hardcodes absolute paths from whoever's machine wrote it.
+.claude/settings.local.json

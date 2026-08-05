@@ -4,7 +4,8 @@ from typing import Optional
 
 import click
 
-from sp_cli.constants import DESCRIPTION_MAX_LENGTH, NAME_MAX_LENGTH
+from sp_cli.constants import (DESCRIPTION_MAX_LENGTH, MAX_OFFSET,
+                              MAX_PAGE_LIMIT, NAME_MAX_LENGTH)
 from sp_cli.runner import clean_params, fetch_and_render, send_and_render
 
 
@@ -14,8 +15,10 @@ def category() -> None:
 
 
 @category.command('ls')
-@click.option('--limit', type=int, default=None, help='Page size (max 100).')
-@click.option('--offset', type=int, default=None, help='Pagination offset.')
+@click.option('--limit', type=click.IntRange(1, MAX_PAGE_LIMIT), default=None,
+              help=f'Page size (1-{MAX_PAGE_LIMIT}).')
+@click.option('--offset', type=click.IntRange(0, MAX_OFFSET), default=None,
+              help='Pagination offset.')
 @click.pass_context
 def category_ls(ctx: click.Context, limit: Optional[int], offset: Optional[int]) -> None:
     """List categories alphabetically, each with how many tests reference it."""

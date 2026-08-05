@@ -251,3 +251,152 @@ class SpinnerTests(unittest.TestCase):
                 with Spinner('working', enabled=True):
                     pass
         mock_write.assert_not_called()
+
+
+class ConfigIsolationTests(unittest.TestCase):
+    """The suite must never be able to touch the developer's real config.
+
+    A test that omitted --no-save replaced a live saved session with the fake
+    token `spci_x`. The plaintext token is returned only once at creation, so
+    the real credential was unrecoverable. The conftest fixture makes that
+    impossible; this asserts the fixture is actually in force.
+    """
+
+    def test_config_path_is_redirected_away_from_the_real_home(self):
+        """XDG_CONFIG_HOME must point somewhere disposable during tests."""
+        path = config.config_path()
+
+        self.assertNotEqual(path, Path.home() / '.config' / 'sp' / 'config.json')
+        self.assertNotIn('/.config/sp/config.json', str(Path('~').expanduser() / '.config'))
+        # And the redirect target must not be the real user's home.
+        self.assertFalse(str(path).startswith(str(Path('~').expanduser()) + '/.config/sp'))
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_a_login_without_no_save_cannot_escape_the_sandbox(self, mock_request):
+        """Even a careless future test writes only inside the fixture's tmp dir."""
+        mock_request.return_value = {'token': 'spci_careless'}
+        result = CliRunner().invoke(cli, [
+            'auth', 'login', '--email', 'a@b.c', '--password', 'pw'])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(config.saved_token(), 'spci_careless')
+        # Written, but under the redirected home -- not the real one.
+        self.assertTrue(str(config.config_path()).startswith(os.environ['XDG_CONFIG_HOME']))
+
+
+class LogoutOwnershipTests(unittest.TestCase):
+    """`logout` must only clear a session it actually owns.
+
+    Revoking a scratch token from --token/SP_API_TOKEN used to delete an
+    unrelated saved credential, which cannot be recovered because the plaintext
+    token is returned only once at creation.
+    """
+
+    def setUp(self):
+        """Create a runner for each test."""
+        self.runner = CliRunner()
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_revoking_a_scratch_token_leaves_the_saved_session_alone(self, mock_request):
+        """The saved 30-day session survives `SP_API_TOKEN=... sp auth logout`."""
+        config.save_token('the-real-session')
+        mock_request.return_value = None
+
+        with mock.patch.dict(os.environ, {'SP_API_TOKEN': 'scratch-token'}):
+            result = self.runner.invoke(cli, ['auth', 'logout'])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(config.saved_token(), 'the-real-session')
+        self.assertFalse(json.loads(result.stdout)['saved_session_cleared'])
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_revoking_the_saved_token_does_clear_it(self, mock_request):
+        """The ordinary case still logs you out."""
+        config.save_token('the-real-session')
+        mock_request.return_value = None
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('SP_API_TOKEN', None)
+            result = self.runner.invoke(cli, ['auth', 'logout'])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertIsNone(config.saved_token())
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_an_explicit_token_matching_the_saved_one_still_clears(self, mock_request):
+        """Matched by value, not provenance, so --token with the same value counts."""
+        config.save_token('same-token')
+        mock_request.return_value = None
+
+        result = self.runner.invoke(cli, ['--token', 'same-token', 'auth', 'logout'])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertIsNone(config.saved_token())
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_a_dropped_connection_does_not_discard_a_good_token(self, mock_request):
+        """The server was never reached; the token may still be perfectly valid."""
+        from sp_cli.client import ApiError
+        config.save_token('probably-fine')
+        mock_request.side_effect = ApiError('connection_error', 'Could not reach host')
+
+        result = self.runner.invoke(cli, ['auth', 'logout'])
+
+        self.assertEqual(result.exit_code, 3)
+        self.assertEqual(config.saved_token(), 'probably-fine')
+
+    @mock.patch('sp_cli.client.ApiClient.request')
+    def test_a_rejected_token_is_still_cleared(self, mock_request):
+        """401 means it cannot work again, so leaving it on disk helps nobody."""
+        from sp_cli.client import ApiError
+        config.save_token('expired')
+        mock_request.side_effect = ApiError('unauthorized', 'Token expired.', 401)
+
+        result = self.runner.invoke(cli, ['auth', 'logout'])
+
+        self.assertEqual(result.exit_code, 6)
+        self.assertIsNone(config.saved_token())
+
+
+class TokenFilePermissionTests(unittest.TestCase):
+    """The token must never be written into a file others can read.
+
+    os.open's mode applies only when the file is created, so a re-login into an
+    already-loose file used to write the secret first and chmod second.
+    """
+
+    def setUp(self):
+        """Create a runner for each test."""
+        self.runner = CliRunner()
+
+    def test_rewriting_a_loose_file_tightens_it_before_writing(self):
+        """The permissions are 0600 by the time any token byte is on disk."""
+        path = config.save_token('first-token')
+        os.chmod(path, 0o644)
+        self.assertTrue(config.is_world_readable())
+
+        observed = []
+        real_dump = json.dump
+
+        def spy(data, handle, **kwargs):
+            # Snapshot the mode at the moment the secret is being serialized.
+            observed.append(stat.S_IMODE(os.fstat(handle.fileno()).st_mode))
+            return real_dump(data, handle, **kwargs)
+
+        with mock.patch('sp_cli.config.json.dump', spy):
+            config.save_token('second-token')
+
+        self.assertEqual(observed, [0o600],
+                         f'token written while mode was {[oct(m) for m in observed]}')
+        self.assertEqual(stat.S_IMODE(Path(path).stat().st_mode), 0o600)
+        self.assertFalse(config.is_world_readable())
+
+    def test_clear_token_also_rewrites_privately(self):
+        """The same path is used when logout rewrites the remaining settings."""
+        path = config.save_token('a-token', 'http://example.test/api/v1')
+        os.chmod(path, 0o644)
+
+        config.clear_token()
+
+        self.assertEqual(stat.S_IMODE(Path(path).stat().st_mode), 0o600)
+        self.assertEqual(config.load().get('base_url'), 'http://example.test/api/v1')

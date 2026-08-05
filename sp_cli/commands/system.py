@@ -4,7 +4,8 @@ from typing import Optional
 
 import click
 
-from sp_cli.constants import PLATFORMS, QUEUE_STATUSES
+from sp_cli.constants import (MAX_OFFSET, MAX_PAGE_LIMIT, PLATFORMS,
+                              QUEUE_STATUSES)
 from sp_cli.runner import clean_params, fetch_and_render
 
 
@@ -19,8 +20,10 @@ def health(ctx: click.Context) -> None:
 @click.option('--platform', type=click.Choice(PLATFORMS), default=None, help='Test platform.')
 @click.option('--status', type=click.Choice(QUEUE_STATUSES), default=None,
               help='Restrict to one side of the queue.')
-@click.option('--limit', type=int, default=None, help='Page size (max 100).')
-@click.option('--offset', type=int, default=None, help='Pagination offset.')
+@click.option('--limit', type=click.IntRange(1, MAX_PAGE_LIMIT), default=None,
+              help=f'Page size (1-{MAX_PAGE_LIMIT}).')
+@click.option('--offset', type=click.IntRange(0, MAX_OFFSET), default=None,
+              help='Pagination offset.')
 @click.pass_context
 def queue(ctx: click.Context, platform: Optional[str], status: Optional[str],
           limit: Optional[int], offset: Optional[int]) -> None:

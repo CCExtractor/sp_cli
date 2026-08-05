@@ -114,6 +114,14 @@ agent gets a straight answer about *why* a test failed, without reading logs.
 With `--with-history`, each failure also gets a verdict across previous runs:
 `NEW_REGRESSION`, `STILL_FAILING`, `NEVER_PASSED`, `FLAKY`, `NO_HISTORY`.
 
+How far back that verdict can see depends on the sample. The history endpoint
+pages over every regression test defined on a sample, so a test sharing its
+sample with many others gets a shorter effective window than `--history-depth`
+asks for. When that happens the verdict carries `window_truncated: true` and
+`NEVER_PASSED` is reported at low confidence — it means "did not pass in the
+runs visible here", not "has never passed". Check `prior_runs_considered` for
+the window a verdict was actually based on.
+
 ### Reliability
 
 Failed `GET`s are retried with exponential backoff — connection failures, read

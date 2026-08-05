@@ -6,7 +6,7 @@ import click
 
 from sp_cli.constants import (COMMAND_MAX_LENGTH, DESCRIPTION_MAX_LENGTH,
                               EXPECTED_RC_MAX, EXPECTED_RC_MIN, INPUT_TYPES,
-                              OUTPUT_TYPES)
+                              MAX_OFFSET, MAX_PAGE_LIMIT, OUTPUT_TYPES)
 from sp_cli.runner import clean_params, fetch_and_render, send_and_render
 
 
@@ -21,8 +21,10 @@ def regression() -> None:
 @click.option('--active/--inactive', 'active', default=None,
               help='Select active or inactive tests (default: active only).')
 @click.option('--sample-id', type=int, default=None, help='Filter by sample id.')
-@click.option('--limit', type=int, default=None, help='Page size (max 100).')
-@click.option('--offset', type=int, default=None, help='Pagination offset.')
+@click.option('--limit', type=click.IntRange(1, MAX_PAGE_LIMIT), default=None,
+              help=f'Page size (1-{MAX_PAGE_LIMIT}).')
+@click.option('--offset', type=click.IntRange(0, MAX_OFFSET), default=None,
+              help='Pagination offset.')
 @click.pass_context
 def regression_ls(ctx: click.Context, category: Optional[str], tag: Optional[str],
                   active: Optional[bool], sample_id: Optional[int],
