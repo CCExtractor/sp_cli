@@ -111,6 +111,14 @@ is never colorized.
 `EXIT_CODE_MISMATCH`, `MISSING_OUTPUT`, `OUTPUT_DIFF`, `PASS` — so a person or an
 agent gets a straight answer about *why* a test failed, without reading logs.
 
+One row is reported per failing sample, which is not the same unit `sp run
+summary` counts. Its `error_count` counts individual errors, and a single sample
+can raise more than one: a test that crashes *and* writes a wrong output is one
+`SEGFAULT` row here but an `exit_code_mismatch` plus a `diff_mismatch` there. The
+totals then differ by design — the bad output is a consequence of the crash, not
+a second thing to investigate. Use `sp run error-summary` when you want the
+per-error view.
+
 With `--with-history`, each failure also gets a verdict across previous runs:
 `NEW_REGRESSION`, `STILL_FAILING`, `NEVER_PASSED`, `FLAKY`, `NO_HISTORY`.
 
