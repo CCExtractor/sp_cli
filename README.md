@@ -80,6 +80,7 @@ request), `--retries N`, `--no-color`, and `--version`.
 
 ```bash
 sp investigate <run_id>              # one-shot triage: info + counts + classified failures
+sp run compare <run_id> <baseline>   # which of these failures are new?
 sp investigate <run_id> --with-history   # ... and whether each failure is new
 sp run summary <run_id>              # pass/fail summary for a run
 sp run failures <run_id>             # failing tests, each auto-classified
@@ -167,6 +168,40 @@ asks for. When that happens the verdict carries `window_truncated: true` and
 `NEVER_PASSED` is reported at low confidence — it means "did not pass in the
 runs visible here", not "has never passed". Check `prior_runs_considered` for
 the window a verdict was actually based on.
+
+### Comparing two runs
+
+Reviewing a change asks a comparative question — *which of these failures are
+new?* — and a single run cannot answer it. `run compare` set-diffs one run's
+failures against a baseline you name:
+
+```bash
+sp run compare 9410 9398             # this run vs a baseline run
+sp -o table run compare 9410 9398 --show new    # just the regressions
+```
+
+Every failing test lands in exactly one bucket:
+
+| Bucket | Meaning |
+|--------|---------|
+| `new` | fails here, **ran and passed** in the baseline — the regressions |
+| `changed` | fails in both, with a different code (a diff that became a segfault) |
+| `still_failing` | fails in both with the same code — usually the standing baseline |
+| `fixed` | failed in the baseline, ran here, passed |
+| `not_rerun` | failed in the baseline and produced **no result** here |
+| `no_baseline` | fails here and the baseline never ran this test |
+
+`not_rerun` is the distinction that matters. Skipped samples are omitted from
+`/runs/{id}/samples` entirely rather than reported as `not_started`, so a run
+that died early looks — to a naive diff — like a run that fixed everything.
+Run 9360 recorded 1 result out of 237 while the API called it a `pass`;
+comparing it against a baseline reports 45 `not_rerun` and 0 `fixed`.
+
+Comparisons that are weaker than they look are called out in `warnings`: a
+cross-platform baseline, the same commit on both sides, or missing results.
+
+Unlike `--with-history`, this needs no history endpoint, so it works against
+production today.
 
 ### Finding a pull request's runs
 

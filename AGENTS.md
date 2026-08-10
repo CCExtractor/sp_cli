@@ -50,6 +50,7 @@ read it.
 Then drill in:
 
 ```bash
+sp run compare <run> <baseline>       # which failures are new vs the baseline
 sp run summary <run>                  # counts only, cheapest
 sp run error-summary <run>            # grouped error counts, server-derived
 sp run result <run> <regression_test_id>   # one test: exit code, command, outputs
@@ -72,28 +73,31 @@ you know the SHA.
 
 ## A worked recipe: is this failure new?
 
-This is the question that actually matters on a PR, and the CLI answers it by
-comparison. A real example — a reviewer reported "No output generated but there
-should be" on run 9410:
+This is the question that actually matters on a PR, and it is comparative — a
+single run cannot answer it. A real example: a reviewer reported "No output
+generated but there should be" on run 9410.
 
-1. **Compare platforms for the same commit.** Runs come in linux/windows pairs.
+1. **Diff against a baseline run.**
+   ```bash
+   sp run compare 9410 9398
+   ```
+   23 `new`, 44 `still_failing`, 0 `fixed`. The 44 are the platform's standing
+   baseline — nobody's fault, present on other PRs too. The 23 are what this
+   change actually did.
+
+   Read `not_rerun` before you read `fixed`: a test that produced no result has
+   not been repaired, and a run that died early would otherwise look like a
+   clean sweep.
+
+2. **Compare platforms for the same commit.** Runs come in linux/windows pairs.
    ```bash
    sp investigate 9410   # linux:   45 MISSING_OUTPUT
    sp investigate 9411   # windows: 24 MISSING_OUTPUT
    ```
    Same commit, different result ⇒ it is not the source code.
 
-2. **Compare against another PR's run** to separate new failures from the
-   platform's standing baseline. Set-diff the `regression_test_id`s:
-   ```bash
-   sp investigate 9410 | jq '[.failures[] | select(.code=="MISSING_OUTPUT") | .regression_test_id]' > a.json
-   sp investigate 9398 | jq '[.failures[] | select(.code=="MISSING_OUTPUT") | .regression_test_id]' > b.json
-   ```
-   24 were common to both PRs and both platforms — a pre-existing baseline,
-   nobody's fault. 21 were new and linux-only.
-
-3. **Check the exit codes.** All 21 exited `0` — the program reported success,
-   so "no output" was not a crash.
+3. **Check the exit codes.** All the new failures exited `0` — the program
+   reported success, so "no output" was not a crash.
 
 4. **Read the log.** It contained exactly 21 `(500) INTERNAL SERVER ERROR`
    lines, each inside a test entry that finished with exit code 0; the windows
@@ -101,8 +105,9 @@ should be" on run 9410:
    server, not the tests.
 
 The general shape: **counts are a hypothesis, set-diffs are evidence.** Two runs
-having the same number of failures does not mean the same tests failed — compare
-the sets.
+having the same number of failures does not mean the same tests failed. `run
+compare` does this properly; doing it by hand with `jq` is easy to get subtly
+wrong.
 
 ## Reading the output
 

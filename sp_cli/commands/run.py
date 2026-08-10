@@ -2,11 +2,12 @@
 
 import base64
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import click
 
 from sp_cli.client import ApiError
+from sp_cli.compare import compare_runs, coverage_warnings
 from sp_cli.constants import (ARTIFACT_TYPES, CANCEL_REASON_MIN_LENGTH,
                               COMMIT_SHA_LENGTH, ERROR_GROUP_BY,
                               ERROR_SEVERITIES, ERROR_TYPES, INFRA_ERROR_TYPES,
@@ -19,6 +20,13 @@ from sp_cli.output import render, render_error
 from sp_cli.progress import Spinner
 from sp_cli.runner import clean_params, fetch_and_render, send_and_render
 from sp_cli.triage import classify_sample, is_failure
+
+#: Buckets `run compare` sorts failures into, in the order worth reading them:
+#: regressions first, missing evidence before good news.
+COMPARE_BUCKETS = ('new', 'changed', 'still_failing', 'not_rerun', 'fixed', 'no_baseline')
+
+#: Run fields identifying each side of a comparison.
+_COMPARE_RUN_FIELDS = ('run_id', 'platform', 'commit_sha', 'branch', 'pr_number', 'status')
 
 
 @click.group()
@@ -191,6 +199,90 @@ def run_failures(ctx: click.Context, run_id: int) -> None:
     rows = [classify_sample(s) for s in samples if is_failure(s)]
     render({'data': rows, 'summary': {'failures': len(rows), 'of_total': len(samples)}},
            output, ctx.obj.get('color', False))
+
+
+@run.command('compare')
+@click.argument('run_id', type=int)
+@click.argument('baseline_run_id', type=int)
+@click.option('--show', type=click.Choice(COMPARE_BUCKETS), multiple=True,
+              help='Restrict the report to these buckets (repeatable). Default: all of them.')
+@click.pass_context
+def run_compare(ctx: click.Context, run_id: int, baseline_run_id: int,
+                show: Tuple[str, ...]) -> None:
+    """Diff a run's failures against a baseline run's.
+
+    Answers the question a single run cannot: which of these failures are new?
+    A failure is only new if the baseline ran that same test and passed it.
+
+    Failures present in the baseline but with no result here are reported as
+    `not_rerun`, never as `fixed` -- a skipped test is missing evidence, not
+    good news, and a run that dies early would otherwise look like a run that
+    fixed everything.
+
+    Pick a baseline deliberately: the same platform on the target branch is the
+    usual choice. Comparing the two platforms of one commit is also useful, and
+    is called out as a caveat rather than refused.
+    """
+    client = ctx.obj['client']
+    output = ctx.obj['output']
+    try:
+        with Spinner(f'Comparing run {run_id} against {baseline_run_id}', output != 'json'):
+            run_detail = client.get(f'/runs/{run_id}')
+            baseline_detail = client.get(f'/runs/{baseline_run_id}')
+            run_samples = client.get_paginated(f'/runs/{run_id}/samples')
+            baseline_samples = client.get_paginated(f'/runs/{baseline_run_id}/samples')
+    except ApiError as error:
+        render_error(error, output)
+        raise SystemExit(error.exit_code)
+
+    result = compare_runs(run_samples, baseline_samples)
+    report: Dict[str, Any] = {
+        'run': {field: run_detail.get(field) for field in _COMPARE_RUN_FIELDS},
+        'baseline': {field: baseline_detail.get(field) for field in _COMPARE_RUN_FIELDS},
+        **result,
+    }
+    warnings = coverage_warnings(run_detail, baseline_detail, result)
+    if warnings:
+        report['warnings'] = warnings
+
+    if output == 'json':
+        render(report, 'json')
+    else:
+        _print_comparison(report, set(show) or set(COMPARE_BUCKETS), ctx.obj.get('color', False))
+
+
+def _print_comparison(report: Dict[str, Any], show: Set[str], color: bool) -> None:
+    """
+    Print a human-readable comparison digest.
+
+    :param report: The assembled comparison report.
+    :type report: Dict[str, Any]
+    :param show: Which buckets to list in full.
+    :type show: Set[str]
+    :param color: Whether to colorize the classification columns.
+    :type color: bool
+    """
+    run, baseline = report['run'], report['baseline']
+    click.echo(f"Run {run.get('run_id')} ({run.get('platform')}, {run.get('status')})"
+               f"  vs baseline {baseline.get('run_id')} "
+               f"({baseline.get('platform')}, {baseline.get('status')})")
+
+    counts = report['counts']
+    click.echo()
+    for bucket in COMPARE_BUCKETS:
+        click.echo(f"  {str(counts[bucket]).rjust(4)}  {bucket}")
+
+    for warning in report.get('warnings', []):
+        # stderr: the diff is the answer, this qualifies it.
+        click.echo(f"  note: {warning}", err=True)
+
+    for bucket in COMPARE_BUCKETS:
+        rows = report[bucket]
+        if not rows or bucket not in show:
+            continue
+        click.echo()
+        click.echo(f"  {bucket} ({len(rows)}):")
+        render({'data': rows}, 'table', color)
 
 
 @run.command('results')

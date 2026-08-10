@@ -1439,3 +1439,58 @@ class PrFilterTests(unittest.TestCase):
 
         self.assertNotEqual(result.exit_code, 0)
         mock_paginated.assert_not_called()
+
+
+class RunCompareTests(unittest.TestCase):
+    """`run compare` wires the diff up to two runs and keeps the caveats visible."""
+
+    def setUp(self):
+        """Create a runner for each test."""
+        self.runner = CliRunner()
+
+    @staticmethod
+    def _sample(test_id, status):
+        """Build a minimal RunSample result."""
+        return {'regression_test_id': test_id, 'sample_id': test_id,
+                'sample_name': f'sample-{test_id}', 'status': status,
+                'exit_code': 0, 'expected_rc': 0, 'outputs': []}
+
+    def _invoke(self, run_samples, baseline_samples, run=None, baseline=None, args=()):
+        """Run `run compare` against canned run details and results."""
+        run = run or {'run_id': 1, 'platform': 'linux', 'commit_sha': 'a' * 40, 'status': 'fail'}
+        baseline = baseline or {'run_id': 2, 'platform': 'linux',
+                                'commit_sha': 'b' * 40, 'status': 'fail'}
+        with mock.patch('sp_cli.client.ApiClient.get', side_effect=[run, baseline]), \
+                mock.patch('sp_cli.client.ApiClient.get_paginated',
+                           side_effect=[run_samples, baseline_samples]):
+            return self.runner.invoke(cli, ['run', 'compare', '1', '2', *args])
+
+    def test_reports_the_buckets(self):
+        """A regression, a persistent failure and a repair, told apart."""
+        result = self._invoke(
+            [self._sample(1, 'fail'), self._sample(2, 'fail'), self._sample(3, 'pass')],
+            [self._sample(1, 'pass'), self._sample(2, 'fail'), self._sample(3, 'fail')])
+
+        self.assertEqual(result.exit_code, 0)
+        payload = json.loads(result.output)
+        self.assertEqual(payload['counts']['new'], 1)
+        self.assertEqual(payload['counts']['still_failing'], 1)
+        self.assertEqual(payload['counts']['fixed'], 1)
+
+    def test_a_collapsed_run_does_not_report_the_baseline_as_fixed(self):
+        """Run 9360 recorded 1 of 237 results while the API called it a pass."""
+        result = self._invoke([], [self._sample(1, 'fail'), self._sample(2, 'fail')])
+
+        payload = json.loads(result.output)
+        self.assertEqual(payload['counts']['fixed'], 0)
+        self.assertEqual(payload['counts']['not_rerun'], 2)
+        self.assertTrue(any('not_rerun rather than fixed' in w
+                            for w in payload['warnings']))
+
+    def test_json_output_carries_both_run_headers(self):
+        """A diff is meaningless without knowing which two runs produced it."""
+        result = self._invoke([self._sample(1, 'fail')], [self._sample(1, 'pass')])
+
+        payload = json.loads(result.output)
+        self.assertEqual(payload['run']['run_id'], 1)
+        self.assertEqual(payload['baseline']['run_id'], 2)
