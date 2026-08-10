@@ -23,15 +23,19 @@ same ground with the safety rules and JSON shapes an agent needs.
 
 ## Quick start
 
+You need a Sample Platform account — `sp` authenticates with the same email and
+password you use on the site, and cannot create an account for you. Everything
+except `sp health` requires one.
+
 ```bash
-pip install -e .                                                   # installs the `sp` command
-export SP_BASE_URL=https://sampleplatform.ccextractor.org/api/v1   # or your own instance
-sp auth login --email you@example.com --scope runs:read --scope results:read
-sp -o table investigate 9412                                       # first real command
+pip install -e .                                             # installs the `sp` command
+sp auth login --email you@example.com --scope runs:read --scope results:read --scope system:read
+sp -o table investigate 9412                                 # first real command
 ```
 
 That last line prints the run header, the pass/fail counts, and every failure
-labelled with why it failed.
+labelled with why it failed. No host to configure: `sp` points at
+`https://sampleplatform.ccextractor.org/api/v1` unless told otherwise.
 
 ## Install
 
@@ -44,16 +48,22 @@ Python 3.10 or newer. Both forms install the `sp` command onto your `PATH`.
 
 ## Configure
 
-`sp` needs to know where the API lives and (optionally) a bearer token:
+`sp` talks to the public deployment by default, so the only thing it usually
+needs is a token. Point it elsewhere — a local instance, a staging deployment —
+with `SP_BASE_URL`:
 
 ```bash
-export SP_BASE_URL=https://sampleplatform.ccextractor.org/api/v1   # or your instance
-export SP_API_TOKEN=<your-token>                                   # if the API requires auth
+export SP_BASE_URL=http://127.0.0.1:5058/api/v1   # your own instance
+export SP_API_TOKEN=<your-token>                  # if you'd rather not save a session
 ```
 
 Both can also be passed per-command with `--base-url` and `--token`.
 
-Or log in once and let `sp` remember the token:
+The host is resolved as `--base-url` > `SP_BASE_URL` > the saved session > the
+public default, so logging in against your own instance is remembered and you
+do not have to export anything again.
+
+Log in once and let `sp` remember the token:
 
 ```bash
 sp auth login --email you@example.com
@@ -67,9 +77,26 @@ it at all.
 **Ask only for the scopes you need.** A token created with `--scope runs:read
 --scope results:read --scope system:read` can read everything the investigation
 commands touch and cannot change anything — the right default for exploring a
-live deployment, and essential if an agent is driving. The seven scopes are
-`runs:read`, `runs:write`, `results:read`, `baselines:write`, `system:read`,
-`system:write`, and `tokens:manage`; a token lasts at most 30 days.
+live deployment, and essential if an agent is driving. A token lasts at most 30
+days.
+
+Passing no `--scope` at all gets you `runs:read` and `results:read` only, which
+is enough for `investigate`, `compare`, and the result and diff commands, but
+*not* for `run logs` or `run infra-errors` — those need `system:read` and 403
+without it.
+
+| Scope | Grants | Who can request it |
+|-------|--------|--------------------|
+| `runs:read` | list and read runs, results, diffs | anyone |
+| `results:read` | per-sample results and outputs | anyone |
+| `system:read` | build logs, infrastructure errors, queue | anyone |
+| `runs:write` | queue and cancel runs | anyone |
+| `baselines:write` | approve a new expected output | admin only |
+| `system:write` | pause/resume CI, blocked users, extensions | admin only |
+| `tokens:manage` | list your tokens (`sp auth tokens`) | admin only |
+
+Requesting a scope your role cannot grant is refused at login, so a plain user
+cannot list their own tokens — revoke by id, or use `sp auth logout`.
 
 Other global options: `-o/--output {json,table}`, `--timeout N` (seconds, per
 request), `--retries N`, `--no-color`, and `--version`.

@@ -1494,3 +1494,71 @@ class RunCompareTests(unittest.TestCase):
         payload = json.loads(result.output)
         self.assertEqual(payload['run']['run_id'], 1)
         self.assertEqual(payload['baseline']['run_id'], 2)
+
+
+class BaseUrlPrecedenceTests(unittest.TestCase):
+    """Where the API host comes from: --base-url > SP_BASE_URL > saved session > default.
+
+    The default is the public deployment, because there is one canonical Sample
+    Platform and `pip install` then `sp investigate <run>` should work. Anyone
+    running their own instance overrides it, and a session logged in against one
+    is remembered -- `sp auth login` already stored the URL beside the token,
+    but nothing read it back, so a development token was sent to the default
+    host instead.
+    """
+
+    def setUp(self):
+        """Create a runner for each test."""
+        self.runner = CliRunner()
+
+    @staticmethod
+    def _base_url_of(result_client):
+        """Pull the base URL out of the client the group built."""
+        return result_client.base_url
+
+    def _run(self, argv, env=None, saved=None):
+        """Invoke a command and capture the client the group constructed."""
+        captured = {}
+
+        def fake_get(self, path, params=None):
+            captured['base_url'] = self.base_url
+            return {'status': 'ok'}
+
+        with mock.patch('sp_cli.client.ApiClient.get', fake_get), \
+                mock.patch('sp_cli.config.saved_base_url', return_value=saved), \
+                mock.patch('sp_cli.config.saved_token', return_value=None):
+            result = self.runner.invoke(cli, argv, env=env or {})
+        self.assertEqual(result.exit_code, 0, result.output)
+        return captured['base_url']
+
+    def test_default_is_the_public_deployment(self):
+        """Nothing configured means the one deployment that actually exists."""
+        self.assertEqual(self._run(['health']),
+                         'https://sampleplatform.ccextractor.org/api/v1')
+
+    def test_saved_session_beats_the_default(self):
+        """A token issued by a development instance must go back to that instance."""
+        self.assertEqual(self._run(['health'], saved='http://127.0.0.1:5058/api/v1'),
+                         'http://127.0.0.1:5058/api/v1')
+
+    def test_env_var_beats_a_saved_session(self):
+        """SP_BASE_URL is the documented per-shell override."""
+        self.assertEqual(
+            self._run(['health'], env={'SP_BASE_URL': 'https://staging.example/api/v1'},
+                      saved='http://127.0.0.1:5058/api/v1'),
+            'https://staging.example/api/v1')
+
+    def test_the_flag_beats_everything(self):
+        """An explicit --base-url is the most specific thing the caller can say."""
+        self.assertEqual(
+            self._run(['--base-url', 'https://flag.example/api/v1', 'health'],
+                      env={'SP_BASE_URL': 'https://env.example/api/v1'},
+                      saved='http://127.0.0.1:5058/api/v1'),
+            'https://flag.example/api/v1')
+
+    def test_passing_the_default_explicitly_still_beats_a_saved_session(self):
+        """Checked by parameter source, not by value, so this is not a saved-session case."""
+        self.assertEqual(
+            self._run(['--base-url', 'https://sampleplatform.ccextractor.org/api/v1', 'health'],
+                      saved='http://127.0.0.1:5058/api/v1'),
+            'https://sampleplatform.ccextractor.org/api/v1')

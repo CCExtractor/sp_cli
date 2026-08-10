@@ -61,6 +61,21 @@ def saved_token() -> Optional[str]:
     return token if isinstance(token, str) and token else None
 
 
+def saved_base_url() -> Optional[str]:
+    """
+    Return the API root the saved token was issued against, if one was stored.
+
+    A token belongs to the deployment that issued it, so remembering one
+    without the other means a session logged in against a development instance
+    silently sends its token to the default host instead.
+
+    :return: The saved base URL, or ``None`` when no usable one is saved.
+    :rtype: Optional[str]
+    """
+    base_url = load().get('base_url')
+    return base_url if isinstance(base_url, str) and base_url else None
+
+
 def _write_private(path: Path, data: Dict[str, Any]) -> None:
     """
     Write JSON to ``path`` with owner-only permissions in force before any bytes land.

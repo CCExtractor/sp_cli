@@ -3,6 +3,7 @@
 from typing import Optional
 
 import click
+from click.core import ParameterSource
 
 from sp_cli import __version__, config
 from sp_cli.client import ApiClient
@@ -15,7 +16,15 @@ from sp_cli.commands.run import run
 from sp_cli.commands.sample import sample
 from sp_cli.commands.system import health, queue
 
-DEFAULT_BASE_URL = 'http://localhost:5000/api/v1'
+#: The public deployment. There is one canonical Sample Platform, and pointing
+#: at it is what almost every caller wants, so `pip install` then
+#: `sp investigate <run>` works with nothing else configured. A localhost
+#: default was worse than it looked: on macOS, ControlCenter owns port 5000 and
+#: answers 403, so the "safe" default produced an auth error from a server that
+#: was never the user's. Anyone running their own instance sets SP_BASE_URL, or
+#: logs in against it once -- `sp auth login` stores the URL alongside the
+#: token, and it is read back below.
+DEFAULT_BASE_URL = 'https://sampleplatform.ccextractor.org/api/v1'
 
 
 @click.group(invoke_without_command=True)
@@ -48,6 +57,13 @@ def cli(ctx: click.Context, base_url: str, token: Optional[str], output: str,
         if token and config.is_world_readable():
             click.echo(f'Warning: {config.config_path()} is readable by other users; '
                        'run chmod 600 on it.', err=True)
+
+    # Same precedence for the host, one step lower than the flag and env var.
+    # Checked by parameter source rather than by value, so passing the default
+    # explicitly still beats a saved session -- and so a saved session for a
+    # development instance is not overridden by the public default.
+    if ctx.get_parameter_source('base_url') == ParameterSource.DEFAULT:
+        base_url = config.saved_base_url() or base_url
 
     ctx.obj = {
         'client': ApiClient(base_url, token=token, timeout=timeout, retries=retries),

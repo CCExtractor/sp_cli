@@ -10,17 +10,25 @@ This file is for an AI agent (or anyone scripting the tool). Humans want
 ## Setup
 
 ```bash
-pip install -e .                                                   # or: pip install git+https://github.com/CCExtractor/sp_cli
-export SP_BASE_URL=https://sampleplatform.ccextractor.org/api/v1
+pip install -e .   # or: pip install git+https://github.com/CCExtractor/sp_cli
 sp auth login --email you@example.com --scope runs:read --scope results:read --scope system:read
 ```
 
+`sp` points at `https://sampleplatform.ccextractor.org/api/v1` by default;
+override with `SP_BASE_URL` or `--base-url` for another deployment.
+
 The token is saved to `~/.config/sp/config.json` (mode `0600`). Precedence is
-`--token` > `SP_API_TOKEN` > that file.
+`--token` > `SP_API_TOKEN` > that file, and the same for the host:
+`--base-url` > `SP_BASE_URL` > the URL saved at login > the default.
 
 **Ask for read scopes only.** With no write scope the tool physically cannot
 change anything, which is what you want when an agent is driving. Grant
-`system:read` — `run logs` and `run infra-errors` need it and are useful.
+`system:read` explicitly — omitting `--scope` gets you `runs:read` and
+`results:read` only, and `run logs` / `run infra-errors` 403 without it.
+
+Login requires an existing Sample Platform account; there is no sign-up here,
+and everything except `sp health` needs one. `baselines:write`, `system:write`
+and `tokens:manage` are admin-only and are refused at login for other roles.
 
 ## Safety rules
 
