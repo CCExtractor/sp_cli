@@ -1362,3 +1362,80 @@ class PageLimitContractTests(unittest.TestCase):
 
         self.assertNotEqual(result.exit_code, 0)
         mock_get.assert_not_called()
+
+
+class PrFilterTests(unittest.TestCase):
+    """`run ls --pr` is filtered locally, because GET /runs has no such parameter.
+
+    The API accepts only platform, branch, commit_sha, repository, status and
+    the date window, so a pull request number cannot be pushed down. That makes
+    two things worth pinning: matches must actually be filtered rather than the
+    whole page returned, and an exhausted scan must be distinguishable from a
+    pull request that genuinely has no runs.
+    """
+
+    def setUp(self):
+        """Create a runner for each test."""
+        self.runner = CliRunner()
+
+    @staticmethod
+    def _runs(*pr_numbers):
+        """Build run rows carrying the given pr_number values."""
+        return [{'run_id': 9000 + i, 'pr_number': pr, 'platform': 'linux', 'status': 'fail'}
+                for i, pr in enumerate(pr_numbers)]
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    def test_only_matching_runs_are_returned(self, mock_paginated):
+        """Rows for other pull requests are dropped, not merely sorted."""
+        mock_paginated.return_value = self._runs(2309, 2290, 2309, None)
+        result = self.runner.invoke(cli, ['run', 'ls', '--pr', '2309'])
+
+        self.assertEqual(result.exit_code, 0)
+        payload = json.loads(result.output)
+        self.assertEqual(payload['total'], 2)
+        self.assertEqual([row['pr_number'] for row in payload['data']], [2309, 2309])
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    def test_a_saturated_scan_is_reported(self, mock_paginated):
+        """Zero matches from a full window is "none I saw", not "none exist"."""
+        mock_paginated.return_value = self._runs(*([2290] * 5))
+        result = self.runner.invoke(cli, ['run', 'ls', '--pr', '2109', '--max-scan', '5'])
+
+        payload = json.loads(result.output)
+        self.assertEqual(payload['total'], 0)
+        self.assertEqual(payload['scanned'], 5)
+        self.assertTrue(payload['scan_truncated'])
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    def test_an_exhausted_scan_is_not_reported_as_truncated(self, mock_paginated):
+        """Fewer rows than the cap means the window really did end."""
+        mock_paginated.return_value = self._runs(2290, 2290)
+        result = self.runner.invoke(cli, ['run', 'ls', '--pr', '2109', '--max-scan', '5'])
+
+        self.assertFalse(json.loads(result.output)['scan_truncated'])
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    def test_server_side_filters_still_reach_the_api(self, mock_paginated):
+        """--platform narrows the scan itself; limit/offset drive it and are not forwarded."""
+        mock_paginated.return_value = self._runs(2309)
+        result = self.runner.invoke(cli, ['run', 'ls', '--pr', '2309', '--platform', 'linux'])
+
+        self.assertEqual(result.exit_code, 0)
+        _, kwargs = mock_paginated.call_args
+        self.assertEqual(kwargs['params'], {'platform': 'linux'})
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    def test_limit_caps_matches_rather_than_the_page(self, mock_paginated):
+        """With a local filter, --limit is only meaningful after filtering."""
+        mock_paginated.return_value = self._runs(2309, 2309, 2309)
+        result = self.runner.invoke(cli, ['run', 'ls', '--pr', '2309', '--limit', '2'])
+
+        self.assertEqual(json.loads(result.output)['total'], 2)
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    def test_offset_is_refused(self, mock_paginated):
+        """An offset indexes the unfiltered list, so it would skip matches silently."""
+        result = self.runner.invoke(cli, ['run', 'ls', '--pr', '2309', '--offset', '10'])
+
+        self.assertNotEqual(result.exit_code, 0)
+        mock_paginated.assert_not_called()

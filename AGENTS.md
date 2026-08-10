@@ -59,7 +59,16 @@ sp run infra-errors <run>             # VM / checkout / build / storage problems
 sp run artifacts <run>                # binary, coredump, stdout, outputs
 sp queue                              # what is running right now
 sp run progress <run>                 # live status of one run
+sp run ls --pr <n>                    # every run for one pull request
+sp run ls --created-after 2026-08-09T00:00:00Z   # recent activity
 ```
+
+`--pr` is filtered client-side — the API has no `pr_number` parameter — so it
+scans the newest `--max-scan` runs (default 500) and matches locally. Check
+`scan_truncated` in the payload before concluding a pull request has no runs:
+`true` means the window ran out, not that nothing exists. Old pull requests need
+a bigger `--max-scan`; `--commit <sha>` is server-side and always cheaper when
+you know the SHA.
 
 ## A worked recipe: is this failure new?
 

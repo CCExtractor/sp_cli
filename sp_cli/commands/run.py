@@ -12,7 +12,8 @@ from sp_cli.constants import (ARTIFACT_TYPES, CANCEL_REASON_MIN_LENGTH,
                               ERROR_SEVERITIES, ERROR_TYPES, INFRA_ERROR_TYPES,
                               LOG_CONTAINS_MAX_LENGTH, LOG_LEVELS, LOG_SOURCES,
                               MAX_OFFSET, MAX_PAGE_LIMIT,
-                              MAX_REGRESSION_TEST_IDS, PLATFORMS, RUN_STATUSES,
+                              MAX_REGRESSION_TEST_IDS, PLATFORMS,
+                              PR_SCAN_DEFAULT, PR_SCAN_MAX, RUN_STATUSES,
                               SAMPLE_STATUSES)
 from sp_cli.output import render, render_error
 from sp_cli.progress import Spinner
@@ -37,26 +38,86 @@ def run() -> None:
               help='Only runs first seen at/after this time (ISO 8601).')
 @click.option('--created-before', 'created_before', default=None,
               help='Only runs first seen at/before this time (ISO 8601).')
+@click.option('--pr', 'pr_number', type=int, default=None,
+              help='Filter by pull request number. The API cannot filter on this, so the CLI '
+                   'scans recent runs and filters locally -- see --max-scan.')
+@click.option('--max-scan', 'max_scan', type=click.IntRange(1, PR_SCAN_MAX), default=PR_SCAN_DEFAULT,
+              show_default=True, help='With --pr, how many recent runs to scan before giving up.')
 @click.option('--limit', type=click.IntRange(1, MAX_PAGE_LIMIT), default=None,
-              help=f'Page size (1-{MAX_PAGE_LIMIT}).')
+              help=f'Page size (1-{MAX_PAGE_LIMIT}). With --pr, caps the matches returned.')
 @click.option('--offset', type=click.IntRange(0, MAX_OFFSET), default=None,
               help='Pagination offset.')
 @click.pass_context
 def run_ls(ctx: click.Context, status: Optional[str], platform: Optional[str], branch: Optional[str],
            commit_sha: Optional[str], repository: Optional[str], sort: Optional[str],
            created_after: Optional[str], created_before: Optional[str],
+           pr_number: Optional[int], max_scan: int,
            limit: Optional[int], offset: Optional[int]) -> None:
     """List CI runs (newest first).
 
     --status only accepts queued, running, and canceled: the API derives them
     from the latest TestProgress row, and pass/fail are per-sample outcomes
     rather than run states. Use `sp run summary` for a run's pass/fail split.
+
+    --pr is filtered client-side because the API has no such parameter. Every
+    other filter is still applied by the server, so combining them narrows what
+    has to be scanned.
     """
     params = clean_params({'status': status, 'platform': platform, 'branch': branch,
                            'commit_sha': commit_sha, 'repository': repository, 'sort': sort,
                            'created_after': created_after, 'created_before': created_before,
                            'limit': limit, 'offset': offset})
+    if pr_number is not None:
+        if offset is not None:
+            # An offset indexes the server's unfiltered list, so pairing it with
+            # a local filter would silently skip matches rather than pages.
+            raise click.BadParameter('cannot be combined with --pr, which filters locally',
+                                     param_hint='--offset')
+        _list_runs_for_pr(ctx, params, pr_number, max_scan, limit)
+        return
     fetch_and_render(ctx, '/runs', params)
+
+
+def _list_runs_for_pr(ctx: click.Context, params: Dict[str, Any],
+                      pr_number: int, max_scan: int, limit: Optional[int]) -> None:
+    """
+    List the runs belonging to one pull request by scanning and filtering locally.
+
+    ``GET /runs`` accepts no ``pr_number``, so the newest ``max_scan`` runs are
+    fetched and matched here. A pull request older than that window comes back
+    empty, which is indistinguishable from having no runs at all -- hence
+    ``scan_truncated`` in the payload, so a caller can tell "none" from "none
+    that I looked at".
+
+    :param ctx: The active Click context.
+    :type ctx: click.Context
+    :param params: Server-side filters already validated by the caller.
+    :type params: Dict[str, Any]
+    :param pr_number: The pull request to match on.
+    :type pr_number: int
+    :param max_scan: Ceiling on how many runs to fetch.
+    :type max_scan: int
+    :param limit: Optional cap on matches returned.
+    :type limit: Optional[int]
+    """
+    client = ctx.obj['client']
+    output = ctx.obj['output']
+    # limit/offset belong to the scan, which get_paginated drives itself.
+    scan_params = {key: value for key, value in params.items() if key not in ('limit', 'offset')}
+    try:
+        with Spinner(f'Scanning runs for PR {pr_number}', output != 'json'):
+            scanned = client.get_paginated('/runs', params=scan_params, max_items=max_scan)
+    except ApiError as error:
+        render_error(error, output)
+        raise SystemExit(error.exit_code)
+
+    matches = [item for item in scanned if item.get('pr_number') == pr_number]
+    truncated = len(scanned) >= max_scan
+    if limit is not None:
+        matches = matches[:limit]
+    render({'data': matches, 'total': len(matches),
+            'scanned': len(scanned), 'scan_truncated': truncated},
+           output, ctx.obj.get('color', False))
 
 
 @run.command('create')

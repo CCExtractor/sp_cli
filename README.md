@@ -1,3 +1,13 @@
+```
+  ___ _ __
+ / __| '_ \
+ \__ \ |_) |
+ |___/ .__/
+     |_|
+  CCExtractor CI · AI-friendly CLI
+  drive CI investigations from the terminal — no UI, no HTML scraping
+```
+
 # sp — CCExtractor Sample Platform CLI
 
 `sp` is a command-line client for the [CCExtractor Sample Platform](https://github.com/CCExtractor/sample-platform)
@@ -5,15 +15,32 @@ REST API. It lets a developer **or an AI agent** investigate CI runs end-to-end
 from the terminal — no web frontend required.
 
 Output defaults to **JSON** (ideal for agents and scripts), with a human-friendly
-`-o table` view.
+`-o table` view. Running `sp` with no arguments prints the banner above along
+with a map of the command groups.
+
+Driving it from an agent? Read [AGENTS.md](AGENTS.md) instead — it covers the
+same ground with the safety rules and JSON shapes an agent needs.
+
+## Quick start
+
+```bash
+pip install -e .                                                   # installs the `sp` command
+export SP_BASE_URL=https://sampleplatform.ccextractor.org/api/v1   # or your own instance
+sp auth login --email you@example.com --scope runs:read --scope results:read
+sp -o table investigate 9412                                       # first real command
+```
+
+That last line prints the run header, the pass/fail counts, and every failure
+labelled with why it failed.
 
 ## Install
 
 ```bash
-pip install -e .
+pip install -e .                                     # from a clone
+pip install git+https://github.com/CCExtractor/sp_cli  # straight from GitHub
 ```
 
-This installs the `sp` command.
+Python 3.10 or newer. Both forms install the `sp` command onto your `PATH`.
 
 ## Configure
 
@@ -36,6 +63,16 @@ That writes the token to `~/.config/sp/config.json` with mode `0600`. Precedence
 is `--token` > `SP_API_TOKEN` > the saved file, so an explicit credential always
 wins. `sp auth logout` revokes it and clears the file; `--no-save` skips writing
 it at all.
+
+**Ask only for the scopes you need.** A token created with `--scope runs:read
+--scope results:read --scope system:read` can read everything the investigation
+commands touch and cannot change anything — the right default for exploring a
+live deployment, and essential if an agent is driving. The seven scopes are
+`runs:read`, `runs:write`, `results:read`, `baselines:write`, `system:read`,
+`system:write`, and `tokens:manage`; a token lasts at most 30 days.
+
+Other global options: `-o/--output {json,table}`, `--timeout N` (seconds, per
+request), `--retries N`, `--no-color`, and `--version`.
 
 ## Usage
 
@@ -68,6 +105,7 @@ diff expected.srt actual.srt
 sp health                            # API + dependency health
 sp queue                             # queue depth and running jobs
 sp run ls                            # list CI runs
+sp run ls --pr 2309                  # ... just one pull request's runs
 sp run create --commit <sha> --platform linux --repository owner/repo
 sp sample ls / show / details <id>   # media samples
 sp regression ls / show <id>         # regression-test definitions
@@ -129,6 +167,26 @@ asks for. When that happens the verdict carries `window_truncated: true` and
 `NEVER_PASSED` is reported at low confidence — it means "did not pass in the
 runs visible here", not "has never passed". Check `prior_runs_considered` for
 the window a verdict was actually based on.
+
+### Finding a pull request's runs
+
+`GET /runs` has no `pr_number` parameter — it filters on platform, branch,
+commit, repository, status and a date window only. `sp run ls --pr N` therefore
+pages newest-first and matches locally, capped by `--max-scan` (default 500).
+
+That cap matters: a pull request whose last run predates the window comes back
+empty, which would otherwise be indistinguishable from having no runs at all.
+The payload carries `scanned` and `scan_truncated` so a caller can tell the two
+apart, and raising `--max-scan` reaches further back.
+
+```bash
+sp run ls --pr 2309                        # recent PR, one page or two
+sp run ls --pr 2109 --max-scan 1500        # months old, wider window
+sp run ls --pr 2309 --platform linux       # server-side filters narrow the scan
+```
+
+When you already know the commit, `--commit <sha>` is filtered by the server and
+is always cheaper.
 
 ### Reliability
 

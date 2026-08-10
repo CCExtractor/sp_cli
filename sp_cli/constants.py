@@ -49,6 +49,15 @@ MAX_PAGE_LIMIT = 100
 #: this (a signed 32-bit maximum).
 MAX_OFFSET = 2147483647
 
+#: ``GET /runs`` has no ``pr_number`` filter -- it accepts only platform, branch,
+#: commit_sha, repository, status and the date window. ``run ls --pr`` therefore
+#: pages newest-first and filters locally, and these bound that scan. The
+#: default covers roughly the last few weeks of activity; an older pull request
+#: needs a larger ``--max-scan`` (or ``--commit``, which the API *can* filter on).
+#: Remove both once the API grows the filter.
+PR_SCAN_DEFAULT = 500
+PR_SCAN_MAX = 10000
+
 #: ``GET /runs/{id}/errors`` — the types ``derive_errors_for_run`` can emit.
 #: Test errors are derived from result rows, not stored, so this is the closed set.
 ERROR_TYPES = ('exit_code_mismatch', 'missing_output', 'diff_mismatch')
