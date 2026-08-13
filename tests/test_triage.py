@@ -1,10 +1,9 @@
 """Tests for the triage helpers that adapt RunSample results into failure rows."""
 
-from tests import SESSION_SANDBOX  # noqa: F401  # redirects the saved session; keep first
-
 import unittest
 
 from sp_cli import triage
+from tests import SESSION_SANDBOX  # noqa: F401
 
 
 class IsFailureTests(unittest.TestCase):

@@ -1,12 +1,11 @@
 """Tests for the cross-run history verdicts behind ``sp investigate --with-history``."""
 
-from tests import SESSION_SANDBOX  # noqa: F401  # redirects the saved session; keep first
-
 import unittest
 
 from sp_cli.history import (FLAKY, NEVER_PASSED, NEW_REGRESSION, NO_HISTORY,
                             STILL_FAILING, UNKNOWN, classify_history,
                             group_by_verdict, split_history, unknown_history)
+from tests import SESSION_SANDBOX  # noqa: F401
 
 
 def entry(run_id, status, regression_test_id=137, signature=None):
