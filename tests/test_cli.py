@@ -1,5 +1,7 @@
 """Tests for the sp CLI command surface, mocking the API client."""
 
+from tests import SESSION_SANDBOX  # noqa: F401  # redirects the saved session; keep first
+
 import json
 import unittest
 from unittest import mock

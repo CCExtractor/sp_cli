@@ -3,6 +3,8 @@
 The rule these all share: a human-only effect must never reach machine output.
 """
 
+from tests import SESSION_SANDBOX  # noqa: F401  # redirects the saved session; keep first
+
 import json
 import os
 import stat

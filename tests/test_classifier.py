@@ -1,5 +1,7 @@
 """Tests for the rule-based failure classifier, using real examples from run #9299."""
 
+from tests import SESSION_SANDBOX  # noqa: F401  # redirects the saved session; keep first
+
 import unittest
 
 from sp_cli import classifier

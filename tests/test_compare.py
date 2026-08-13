@@ -1,5 +1,7 @@
 """Tests for the run-to-run failure diff behind ``sp run compare``."""
 
+from tests import SESSION_SANDBOX  # noqa: F401  # redirects the saved session; keep first
+
 import unittest
 
 from sp_cli import compare
