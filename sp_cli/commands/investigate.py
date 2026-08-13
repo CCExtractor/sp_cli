@@ -1,0 +1,273 @@
+"""``sp investigate`` — one-shot triage of a run (status + counts + classified failures)."""
+
+from typing import Any, Dict, List, Optional
+
+import click
+
+from sp_cli.client import ApiError
+from sp_cli.constants import MAX_PAGE_LIMIT
+from sp_cli.history import (NEW_REGRESSION, classify_history, group_by_verdict,
+                            split_history, unknown_history)
+from sp_cli.output import render, render_error
+from sp_cli.progress import Spinner
+from sp_cli.runner import clean_params
+from sp_cli.triage import classify_sample, group_by_code, is_failure
+
+_RUN_FIELDS = ('run_id', 'pr_number', 'platform', 'commit_sha', 'branch', 'status', 'github_link')
+
+#: Consecutive failed history lookups before the endpoint is treated as down.
+#: Without this a broken endpoint costs one full timeout per failing sample --
+#: 45 samples x 30s is a 22-minute hang for an answer that will not come.
+_HISTORY_FAILURE_LIMIT = 3
+
+#: How many prior runs to weigh per failure when --with-history is used. Deep
+#: enough to see a sample settle, shallow enough to keep it one call per sample.
+DEFAULT_HISTORY_DEPTH = 20
+
+
+@click.command('investigate')
+@click.argument('run_id', type=int)
+@click.option('--with-history', 'with_history', is_flag=True, default=False,
+              help='Label each failure as a new regression, long-standing, or never-passing.')
+@click.option('--history-depth', type=click.IntRange(1, MAX_PAGE_LIMIT - 1), default=None,
+              help=f'Prior runs to weigh per failure (default: {DEFAULT_HISTORY_DEPTH}, '
+                   f'max {MAX_PAGE_LIMIT - 1}). Implies --with-history.')
+@click.pass_context
+def investigate(ctx: click.Context, run_id: int, with_history: bool,
+                history_depth: Optional[int]) -> None:
+    """Triage a run in one shot: run info, pass/fail counts, and classified failures.
+
+    Combines the run detail, summary, and per-result classification into a single
+    report -- the whole "what failed and why" investigation in one command.
+
+    --with-history answers the question the codes alone cannot: is this failure
+    new? It adds a `history` block to every failure plus a `by_verdict` tally,
+    at the cost of one extra API call per distinct sample. NEW_REGRESSION means
+    the test passed in the previous run, which is where to start reading.
+    """
+    client = ctx.obj['client']
+    output = ctx.obj['output']
+    if history_depth is not None:
+        with_history = True
+    depth = history_depth if history_depth is not None else DEFAULT_HISTORY_DEPTH
+
+    try:
+        with Spinner(f'Investigating run {run_id}', output != 'json'):
+            run = client.get(f'/runs/{run_id}')
+            summary = client.get(f'/runs/{run_id}/summary')
+            samples = client.get_paginated(f'/runs/{run_id}/samples')
+    except ApiError as error:
+        render_error(error, output)
+        raise SystemExit(error.exit_code)
+
+    failures = [classify_sample(s) for s in samples if is_failure(s)]
+    report: Dict[str, Any] = {
+        'run': {field: run.get(field) for field in _RUN_FIELDS},
+        'summary': summary,
+        'by_code': group_by_code(failures),
+        'failures': failures,
+    }
+
+    if with_history:
+        with Spinner('Fetching sample history', output != 'json'):
+            degraded = _attach_history(client, failures, run_id, run.get('platform'), depth)
+        report['by_verdict'] = group_by_verdict(failures)
+        if degraded:
+            report['history_incomplete'] = degraded
+
+    if output == 'json':
+        render(report, 'json')
+    else:
+        _print_digest(report, with_history, ctx.obj.get('color', False))
+
+
+def _attach_history(client: Any, failures: List[Dict[str, Any]], run_id: int,
+                    platform: Optional[str], depth: int) -> Optional[Dict[str, Any]]:
+    """
+    Add a ``history`` verdict block to every failure row, in place.
+
+    History is fetched per *sample*, but several regression tests can share one
+    sample, so responses are cached by sample id and then narrowed per failure
+    by regression test id. Restricting to the run's own platform keeps a Windows
+    failure from being judged against Linux history.
+
+    A lookup that fails degrades that one row to UNKNOWN rather than aborting:
+    the classified failures and the run summary are the bulk of the answer, and
+    throwing all of it away because one sample's history is unavailable is worse
+    than reporting the gap. After ``_HISTORY_FAILURE_LIMIT`` consecutive
+    failures the endpoint is treated as down and the rest are marked without
+    calling it -- otherwise a broken endpoint costs one full timeout per sample.
+
+    :param client: The API client.
+    :type client: Any
+    :param failures: Classified failure rows, mutated in place.
+    :type failures: List[Dict[str, Any]]
+    :param run_id: The run being investigated.
+    :type run_id: int
+    :param platform: The run's platform, used to filter history.
+    :type platform: Optional[str]
+    :param depth: How many prior runs to consider per failure.
+    :type depth: int
+    :return: A summary of what could not be fetched, or ``None`` if all of it was.
+    :rtype: Optional[Dict[str, Any]]
+    """
+    cache: Dict[int, List[Dict[str, Any]]] = {}
+    # Failures are remembered per sample too. Several regression tests share one
+    # sample, so without this a single unreachable sample is re-fetched once per
+    # row -- paying the timeout again each time and counting itself repeatedly
+    # toward the breaker, which then trips on one sample rather than three.
+    failed: Dict[int, str] = {}
+    consecutive_failures = 0
+    given_up = False
+    last_error: Optional[str] = None
+
+    for failure in failures:
+        sample_id = failure.get('sample_id')
+        if not isinstance(sample_id, int):
+            failure['history'] = unknown_history('Result has no sample id to look up')
+            continue
+
+        if sample_id in failed:
+            failure['history'] = unknown_history(f'History lookup failed: {failed[sample_id]}')
+            continue
+
+        if sample_id not in cache:
+            # Checked here rather than at the top of the loop: giving up must
+            # only stop *new* requests. A sample already fetched successfully
+            # can still be classified from memory.
+            if given_up:
+                failure['history'] = unknown_history(
+                    'Skipped: the history endpoint is not responding')
+                continue
+
+            # A full page, not depth + 1. The endpoint returns entries for
+            # *every* regression test defined on the sample and slices only
+            # afterwards, so a page of N covers roughly N/(tests on this sample)
+            # runs of the one test being investigated -- asking for depth + 1
+            # silently delivered a fraction of it. Requesting the maximum costs
+            # the server nothing today, because it loads the sample's whole
+            # history and paginates in Python either way (sample-platform#1161).
+            params = clean_params({'platform': platform, 'limit': MAX_PAGE_LIMIT})
+            try:
+                cache[sample_id] = client.get_paginated(
+                    f'/samples/{sample_id}/history', params=params,
+                    max_items=MAX_PAGE_LIMIT)
+                consecutive_failures = 0
+            except ApiError as error:
+                consecutive_failures += 1
+                last_error = error.message
+                failed[sample_id] = error.code
+                failure['history'] = unknown_history(f'History lookup failed: {error.code}')
+                if consecutive_failures >= _HISTORY_FAILURE_LIMIT:
+                    given_up = True
+                continue
+
+        entries = cache[sample_id]
+        current, prior = split_history(entries, run_id, failure.get('regression_test_id'))
+        # A saturated page means the sample's history continues past what was
+        # read, so a window shorter than requested is a limit of the read rather
+        # than of the test's actual history. NEVER_PASSED must not be asserted
+        # confidently on that basis.
+        truncated = len(entries) >= MAX_PAGE_LIMIT and len(prior) < depth
+        failure['history'] = classify_history(current, prior[:depth], truncated)
+
+    if not failed:
+        return None
+    return {
+        'failed_samples': sorted(failed),
+        'gave_up': given_up,
+        'reason': last_error,
+    }
+
+
+def _print_digest(report: Dict[str, Any], with_history: bool = False,
+                  color: bool = False) -> None:
+    """
+    Print a human-readable investigation digest.
+
+    :param report: The assembled investigation report.
+    :type report: Dict[str, Any]
+    :param with_history: Whether history verdicts were collected.
+    :type with_history: bool
+    :param color: Whether to colorize the classification columns.
+    :type color: bool
+    """
+    run = report['run']
+    summary = report['summary']
+    header = (f"Run {run.get('run_id')} · PR {run.get('pr_number')} · {run.get('platform')} · "
+              f"{run.get('commit_sha')} · {str(run.get('status')).upper()}")
+    click.echo(header)
+    click.echo(f"  {summary.get('fail_count')} failed / {summary.get('total_samples')} total"
+               f"  ({summary.get('pass_count')} pass)")
+
+    by_code = report['by_code']
+    if by_code:
+        click.echo()
+        click.echo("  by code:")
+        for code, count in by_code.items():
+            click.echo(f"    {str(count).rjust(4)}  {code}")
+
+    by_verdict = report.get('by_verdict')
+    if by_verdict:
+        click.echo()
+        click.echo("  by history:")
+        for verdict, count in by_verdict.items():
+            click.echo(f"    {str(count).rjust(4)}  {verdict}")
+
+    incomplete = report.get('history_incomplete')
+    if incomplete:
+        # To stderr: the digest itself stays the answer, this is a caveat on it.
+        note = (f"  note: history unavailable for {len(incomplete['failed_samples'])} "
+                f"sample(s); those rows are UNKNOWN")
+        if incomplete.get('gave_up'):
+            note += ' (stopped asking after repeated failures)'
+        click.echo(note, err=True)
+
+    failures: List[Dict[str, Any]] = report['failures']
+    if failures:
+        click.echo()
+        render({'data': [_flatten(f, with_history) for f in failures]}, 'table', color)
+
+    _print_regressions(failures, with_history)
+
+
+def _print_regressions(failures: List[Dict[str, Any]], with_history: bool) -> None:
+    """
+    Call out the failures that were passing in the previous run.
+
+    :param failures: Classified failure rows.
+    :type failures: List[Dict[str, Any]]
+    :param with_history: Whether history verdicts were collected.
+    :type with_history: bool
+    """
+    if not with_history:
+        return
+    regressions = [f for f in failures
+                   if f.get('history', {}).get('verdict') == NEW_REGRESSION]
+    if not regressions:
+        return
+    click.echo()
+    click.echo(f"  {len(regressions)} of these were passing in the previous run:")
+    for failure in regressions:
+        click.echo(f"    {failure.get('sample_name')} — {failure['history']['reason']}")
+
+
+def _flatten(failure: Dict[str, Any], with_history: bool) -> Dict[str, Any]:
+    """
+    Flatten a failure row for the table view, lifting the verdict into a column.
+
+    The nested ``history`` block is right for JSON and wrong for a table, which
+    needs scalar cells.
+
+    :param failure: One classified failure row.
+    :type failure: Dict[str, Any]
+    :param with_history: Whether to add the verdict column.
+    :type with_history: bool
+    :return: A flat row safe to render as a table.
+    :rtype: Dict[str, Any]
+    """
+    if not with_history:
+        return failure
+    row = {key: value for key, value in failure.items() if key != 'history'}
+    row['verdict'] = failure.get('history', {}).get('verdict')
+    return row

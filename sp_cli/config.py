@@ -1,0 +1,170 @@
+"""Saved login session at ``~/.config/sp/config.json``.
+
+Holds the token produced by ``sp auth login`` so it does not have to be pasted
+into ``SP_API_TOKEN`` for every shell. The file is written ``0600`` because it
+holds a bearer credential; a token in a world-readable file is a token leak.
+
+Precedence is ``--token`` > ``SP_API_TOKEN`` > this file, so an explicit flag
+or an env var always wins over whatever was saved earlier.
+"""
+
+import json
+import os
+import stat
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+#: Octal mode for the config file and its directory: owner-only.
+_FILE_MODE = 0o600
+_DIR_MODE = 0o700
+
+
+def config_path() -> Path:
+    """
+    Locate the config file, honouring ``XDG_CONFIG_HOME``.
+
+    :return: Absolute path to ``sp/config.json`` under the config home.
+    :rtype: Path
+    """
+    xdg = os.environ.get('XDG_CONFIG_HOME')
+    base = Path(xdg) if xdg else Path.home() / '.config'
+    return base / 'sp' / 'config.json'
+
+
+def load() -> Dict[str, Any]:
+    """
+    Read the saved session, tolerating a missing or corrupt file.
+
+    A malformed file returns empty rather than raising: a bad config should
+    degrade to "not logged in", never break every command.
+
+    :return: The saved mapping, or an empty dict.
+    :rtype: Dict[str, Any]
+    """
+    path = config_path()
+    try:
+        with path.open(encoding='utf-8') as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def saved_token() -> Optional[str]:
+    """
+    Return the saved bearer token, if one was stored.
+
+    :return: The token, or ``None`` when no usable session is saved.
+    :rtype: Optional[str]
+    """
+    token = load().get('token')
+    return token if isinstance(token, str) and token else None
+
+
+def saved_base_url() -> Optional[str]:
+    """
+    Return the API root the saved token was issued against, if one was stored.
+
+    A token belongs to the deployment that issued it, so remembering one
+    without the other means a session logged in against a development instance
+    silently sends its token to the default host instead.
+
+    :return: The saved base URL, or ``None`` when no usable one is saved.
+    :rtype: Optional[str]
+    """
+    base_url = load().get('base_url')
+    return base_url if isinstance(base_url, str) and base_url else None
+
+
+def _write_private(path: Path, data: Dict[str, Any]) -> None:
+    """
+    Write JSON to ``path`` with owner-only permissions in force before any bytes land.
+
+    ``os.open``'s mode argument only applies when the file is *created*; an
+    existing file keeps whatever permissions it already had. Writing first and
+    ``chmod``-ing afterwards therefore leaves a window in which a fresh token
+    sits in a still-world-readable file. Tightening the open descriptor with
+    ``fchmod`` before writing closes that window, and works on the descriptor so
+    there is no path-swap race either.
+
+    :param path: The file to write.
+    :type path: Path
+    :param data: The mapping to serialize.
+    :type data: Dict[str, Any]
+    """
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _FILE_MODE)
+    with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+        if hasattr(os, 'fchmod'):
+            os.fchmod(handle.fileno(), _FILE_MODE)
+        json.dump(data, handle, indent=2)
+        handle.write('\n')
+    if not hasattr(os, 'fchmod'):  # Windows: no descriptor-level chmod available.
+        os.chmod(path, _FILE_MODE)
+
+
+def save_token(token: str, base_url: Optional[str] = None) -> Path:
+    """
+    Persist a token (and optionally the base URL it belongs to) at mode 0600.
+
+    The permissions are tightened before the token is written, so the secret is
+    never briefly world-readable -- including on re-login, when the file already
+    exists and ``os.open``'s creation mode would be ignored.
+
+    :param token: The plaintext bearer token to store.
+    :type token: str
+    :param base_url: The API root the token authenticates against.
+    :type base_url: Optional[str]
+    :return: The path written.
+    :rtype: Path
+    """
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=_DIR_MODE)
+
+    data = load()
+    data['token'] = token
+    if base_url:
+        data['base_url'] = base_url
+
+    _write_private(path, data)
+    return path
+
+
+def clear_token() -> bool:
+    """
+    Remove the saved token, leaving any other settings in place.
+
+    :return: ``True`` if a token was actually removed.
+    :rtype: bool
+    """
+    path = config_path()
+    data = load()
+    if 'token' not in data:
+        return False
+    del data['token']
+
+    if not data:
+        try:
+            path.unlink()
+        except OSError:
+            return False
+        return True
+
+    _write_private(path, data)
+    return True
+
+
+def is_world_readable() -> bool:
+    """
+    Report whether the config file is readable by anyone but its owner.
+
+    Used to warn when a token file was created by an older version, or had its
+    permissions loosened by hand.
+
+    :return: ``True`` when group or other bits are set.
+    :rtype: bool
+    """
+    try:
+        mode = config_path().stat().st_mode
+    except OSError:
+        return False
+    return bool(mode & (stat.S_IRWXG | stat.S_IRWXO))
