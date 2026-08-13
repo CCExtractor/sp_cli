@@ -3,6 +3,7 @@
 import unittest
 
 from sp_cli import classifier
+from tests import SESSION_SANDBOX  # noqa: F401
 
 
 class ClassifierTests(unittest.TestCase):

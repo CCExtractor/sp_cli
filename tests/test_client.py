@@ -6,6 +6,7 @@ from unittest import mock
 import requests  # type: ignore[import-untyped]
 
 from sp_cli.client import ApiClient, ApiError
+from tests import SESSION_SANDBOX  # noqa: F401
 
 
 class FakeResponse:

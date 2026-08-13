@@ -8,6 +8,7 @@ from click.testing import CliRunner
 
 from sp_cli.client import ApiError
 from sp_cli.main import cli
+from tests import SESSION_SANDBOX  # noqa: F401
 
 RUNS_PAGE = {
     'data': [{'run_id': 9299, 'status': 'fail', 'platform': 'windows', 'commit_sha': 'e6cd34e'}],

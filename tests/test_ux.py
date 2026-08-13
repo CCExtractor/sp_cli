@@ -16,6 +16,7 @@ from click.testing import CliRunner
 from sp_cli import config
 from sp_cli.main import cli
 from sp_cli.output import render
+from tests import SESSION_SANDBOX  # noqa: F401
 
 CLASSIFIED_ROWS = {
     'data': [

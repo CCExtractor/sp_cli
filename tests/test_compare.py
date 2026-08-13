@@ -3,6 +3,7 @@
 import unittest
 
 from sp_cli import compare
+from tests import SESSION_SANDBOX  # noqa: F401
 
 
 def sample(test_id, status, exit_code=0, expected_rc=0, outputs=None):
