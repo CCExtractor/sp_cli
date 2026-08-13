@@ -1563,3 +1563,77 @@ class BaseUrlPrecedenceTests(unittest.TestCase):
             self._run(['--base-url', 'https://sampleplatform.ccextractor.org/api/v1', 'health'],
                       saved='http://127.0.0.1:5058/api/v1'),
             'https://sampleplatform.ccextractor.org/api/v1')
+
+
+class RunWaitTests(unittest.TestCase):
+    """Exercise `sp run wait`, with sleeping and the clock stubbed out."""
+
+    def setUp(self):
+        """Create a runner and silence the poll interval."""
+        self.runner = CliRunner()
+        patcher = mock.patch('sp_cli.commands.run.time.sleep')
+        self.addCleanup(patcher.stop)
+        self.sleep = patcher.start()
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_wait_polls_until_terminal(self, mock_get):
+        """A run still running is polled again until it reaches a terminal state."""
+        mock_get.side_effect = [
+            {'run_id': 9476, 'status': 'running'},
+            {'run_id': 9476, 'status': 'pass'},
+        ]
+        result = self.runner.invoke(cli, ['run', 'wait', '9476'])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(mock_get.call_count, 2)
+        self.assertTrue(self.sleep.called)
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_wait_exits_nonzero_when_a_run_fails(self, mock_get):
+        """A failed run exits 1 so a script can gate on it."""
+        mock_get.return_value = {'run_id': 9476, 'status': 'fail'}
+        result = self.runner.invoke(cli, ['run', 'wait', '9476'])
+
+        self.assertEqual(result.exit_code, 1)
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_wait_handles_several_runs(self, mock_get):
+        """Every run is waited on, and one failure is enough to exit non-zero."""
+        mock_get.side_effect = [
+            {'run_id': 9476, 'status': 'pass'},
+            {'run_id': 9477, 'status': 'fail'},
+        ]
+        result = self.runner.invoke(cli, ['run', 'wait', '9476', '9477'])
+
+        self.assertEqual(result.exit_code, 1)
+        payload = json.loads(result.stdout)
+        self.assertEqual([row['run_id'] for row in payload['data']], [9476, 9477])
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_wait_treats_unknown_status_as_terminal(self, mock_get):
+        """An unrecognised status ends the wait instead of polling forever."""
+        mock_get.return_value = {'run_id': 9476, 'status': 'something_new'}
+        result = self.runner.invoke(cli, ['run', 'wait', '9476'])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(mock_get.call_count, 1)
+
+    @mock.patch('sp_cli.commands.run.time.monotonic')
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_wait_times_out(self, mock_get, mock_clock):
+        """Passing the deadline exits 2 and reports what was still pending."""
+        mock_get.return_value = {'run_id': 9476, 'status': 'queued'}
+        # Start, then a reading past the deadline on the first check.
+        mock_clock.side_effect = [0, 10_000, 10_000]
+        result = self.runner.invoke(cli, ['run', 'wait', '9476', '--timeout', '60'])
+
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn('timed out', result.stderr)
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_wait_surfaces_api_errors(self, mock_get):
+        """An API failure stops the wait rather than retrying forever."""
+        mock_get.side_effect = ApiError('not_found', 'no such run', status=404)
+        result = self.runner.invoke(cli, ['run', 'wait', '9476'])
+
+        self.assertNotEqual(result.exit_code, 0)

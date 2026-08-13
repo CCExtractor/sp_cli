@@ -21,6 +21,21 @@ SAMPLE_CATALOG_STATUSES = ('active', 'inactive')
 #: ``TestPlatform`` values accepted by every ``?platform`` filter.
 PLATFORMS = ('linux', 'windows')
 
+#: Statuses a run can still leave. Anything else is terminal, so ``sp run wait``
+#: treats an unrecognised status as finished rather than polling forever.
+RUN_PENDING_STATUSES = ('queued', 'running')
+
+#: Terminal statuses that mean the run itself did not succeed. ``sp run wait``
+#: exits non-zero on these so a script can gate on it.
+RUN_UNSUCCESSFUL_STATUSES = ('fail', 'canceled', 'error')
+
+#: ``sp run wait`` polling bounds, in seconds.
+WAIT_INTERVAL_DEFAULT = 30
+WAIT_INTERVAL_MIN = 5
+WAIT_INTERVAL_MAX = 600
+WAIT_TIMEOUT_DEFAULT = 3600
+WAIT_TIMEOUT_MAX = 86400
+
 #: ``TokenCreateRequestSchema.expires_in_days`` validates ``Range(min=1, max=30)``.
 TOKEN_MIN_DAYS = 1
 TOKEN_MAX_DAYS = 30
