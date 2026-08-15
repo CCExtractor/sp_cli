@@ -134,6 +134,7 @@ sp health                            # API + dependency health
 sp queue                             # queue depth and running jobs
 sp run ls                            # list CI runs
 sp run ls --pr 2309                  # ... just one pull request's runs
+sp run wait 9412 9413                # block until they finish; exit code is the verdict
 sp run create --commit <sha> --platform linux --repository owner/repo
 sp sample ls / show / details <id>   # media samples
 sp regression ls / show <id>         # regression-test definitions
@@ -275,6 +276,13 @@ Scripts and agents can branch on the exit status:
 | 6 | authentication / authorization failure |
 | 7 | rate limited |
 | 8 | conflict (e.g. deleting a test that has results) |
+| 9 | `run wait` gave up before every run finished |
+
+`run wait` additionally exits 1 when a run it waited for failed or was
+canceled. Note what is *not* in this table: **2**, which Click returns for any
+usage error — an unknown flag, a missing argument, an out-of-range value. Never
+give 2 a meaning of your own, or a mistyped flag becomes indistinguishable from
+a real outcome.
 
 ## Development
 
