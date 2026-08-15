@@ -2,6 +2,7 @@
 
 import base64
 import sys
+import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import click
@@ -14,8 +15,12 @@ from sp_cli.constants import (ARTIFACT_TYPES, CANCEL_REASON_MIN_LENGTH,
                               LOG_CONTAINS_MAX_LENGTH, LOG_LEVELS, LOG_SOURCES,
                               MAX_OFFSET, MAX_PAGE_LIMIT,
                               MAX_REGRESSION_TEST_IDS, PLATFORMS,
-                              PR_SCAN_DEFAULT, PR_SCAN_MAX, RUN_STATUSES,
-                              SAMPLE_STATUSES)
+                              PR_SCAN_DEFAULT, PR_SCAN_MAX,
+                              RUN_PENDING_STATUSES, RUN_STATUSES,
+                              RUN_UNSUCCESSFUL_STATUSES, SAMPLE_STATUSES,
+                              WAIT_INTERVAL_DEFAULT, WAIT_INTERVAL_MAX,
+                              WAIT_INTERVAL_MIN, WAIT_TIMEOUT_DEFAULT,
+                              WAIT_TIMEOUT_MAX)
 from sp_cli.output import render, render_error
 from sp_cli.progress import Spinner
 from sp_cli.runner import clean_params, fetch_and_render, send_and_render
@@ -750,3 +755,84 @@ def _resolve_diff_targets(client: Any, run_id: int, sample_id: int,
         return [(media_sample_id, reg_id, output_id)]
     return [(media_sample_id, reg_id, o.get('output_id')) for o in differing
             if o.get('output_id') is not None]
+
+
+@run.command('wait')
+@click.argument('run_ids', type=int, nargs=-1, required=True)
+@click.option('--interval', type=click.IntRange(WAIT_INTERVAL_MIN, WAIT_INTERVAL_MAX),
+              default=WAIT_INTERVAL_DEFAULT, show_default=True,
+              help='Seconds between polls.')
+@click.option('--timeout', type=click.IntRange(1, WAIT_TIMEOUT_MAX),
+              default=WAIT_TIMEOUT_DEFAULT, show_default=True,
+              help='Give up after this many seconds.')
+@click.option('--quiet', is_flag=True, default=False,
+              help='Suppress the progress lines written to stderr.')
+@click.pass_context
+def run_wait(ctx: click.Context, run_ids: Tuple[int, ...], interval: int,
+             timeout: int, quiet: bool) -> None:
+    """Block until one or more runs reach a terminal state.
+
+    Polls each run until it is no longer queued or running, then prints the
+    final run records. Progress is written to stderr, so the payload on stdout
+    stays pipeable.
+
+    Exits 0 only if every run finished successfully; a failed or canceled run
+    exits 1 and a timeout exits 2, which lets a script gate on the result
+    without parsing the output.
+    """
+    client = ctx.obj['client']
+    output = ctx.obj['output']
+    deadline = time.monotonic() + timeout
+    pending = list(dict.fromkeys(run_ids))
+    finished: Dict[int, Dict[str, Any]] = {}
+
+    while pending:
+        for run_id in list(pending):
+            try:
+                record = client.get(f'/runs/{run_id}')
+            except ApiError as error:
+                render_error(error, output)
+                raise SystemExit(error.exit_code)
+            status = record.get('status')
+            if status not in RUN_PENDING_STATUSES:
+                finished[run_id] = record
+                pending.remove(run_id)
+                if not quiet:
+                    click.echo(f'run {run_id}: {status}', err=True)
+        if not pending:
+            break
+        if time.monotonic() >= deadline:
+            if not quiet:
+                click.echo(f'timed out after {timeout}s; still pending: '
+                           f'{", ".join(str(r) for r in pending)}', err=True)
+            _render_wait(ctx, run_ids, finished, output)
+            raise SystemExit(2)
+        if not quiet:
+            click.echo(f'waiting on {", ".join(str(r) for r in pending)} '
+                       f'({interval}s)', err=True)
+        # Never sleep past the deadline; the next loop reports the timeout.
+        time.sleep(min(interval, max(0, deadline - time.monotonic())))
+
+    _render_wait(ctx, run_ids, finished, output)
+    if any(record.get('status') in RUN_UNSUCCESSFUL_STATUSES
+           for record in finished.values()):
+        raise SystemExit(1)
+
+
+def _render_wait(ctx: click.Context, run_ids: Tuple[int, ...],
+                 finished: Dict[int, Dict[str, Any]], output: str) -> None:
+    """
+    Render the runs that reached a terminal state, in the order asked for.
+
+    :param ctx: The active Click context.
+    :type ctx: click.Context
+    :param run_ids: Run ids as given on the command line.
+    :type run_ids: Tuple[int, ...]
+    :param finished: Terminal run records, keyed by run id.
+    :type finished: Dict[int, Dict[str, Any]]
+    :param output: Output mode.
+    :type output: str
+    """
+    rows = [finished[run_id] for run_id in dict.fromkeys(run_ids) if run_id in finished]
+    payload: Any = rows[0] if len(rows) == 1 else {'data': rows}
+    render(payload, output, ctx.obj.get('color', False))
