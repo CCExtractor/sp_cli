@@ -11,11 +11,11 @@ from sp_cli.client import ApiError
 from sp_cli.compare import compare_runs, coverage_warnings
 from sp_cli.constants import (ARTIFACT_TYPES, CANCEL_REASON_MIN_LENGTH,
                               COMMIT_SHA_LENGTH, ERROR_GROUP_BY,
-                              ERROR_SEVERITIES, ERROR_TYPES, INFRA_ERROR_TYPES,
-                              LOG_CONTAINS_MAX_LENGTH, LOG_LEVELS, LOG_SOURCES,
-                              MAX_OFFSET, MAX_PAGE_LIMIT,
-                              MAX_REGRESSION_TEST_IDS, PLATFORMS,
-                              PR_SCAN_DEFAULT, PR_SCAN_MAX,
+                              ERROR_SEVERITIES, ERROR_TYPES, EXIT_TIMEOUT,
+                              INFRA_ERROR_TYPES, LOG_CONTAINS_MAX_LENGTH,
+                              LOG_LEVELS, LOG_SOURCES, MAX_OFFSET,
+                              MAX_PAGE_LIMIT, MAX_REGRESSION_TEST_IDS,
+                              PLATFORMS, PR_SCAN_DEFAULT, PR_SCAN_MAX,
                               RUN_PENDING_STATUSES, RUN_STATUSES,
                               RUN_UNSUCCESSFUL_STATUSES, SAMPLE_STATUSES,
                               WAIT_INTERVAL_DEFAULT, WAIT_INTERVAL_MAX,
@@ -777,8 +777,13 @@ def run_wait(ctx: click.Context, run_ids: Tuple[int, ...], interval: int,
     stays pipeable.
 
     Exits 0 only if every run finished successfully; a failed or canceled run
-    exits 1 and a timeout exits 2, which lets a script gate on the result
+    exits 1 and a timeout exits 9, which lets a script gate on the result
     without parsing the output.
+
+    A run whose status is `pass` exits 0 even if it recorded results for only a
+    fraction of its samples, because the API derives that status from the rows
+    that exist rather than from the ones expected. Check `sp run summary`'s
+    skipped_count before treating a green wait as full coverage.
     """
     client = ctx.obj['client']
     output = ctx.obj['output']
@@ -806,7 +811,7 @@ def run_wait(ctx: click.Context, run_ids: Tuple[int, ...], interval: int,
                 click.echo(f'timed out after {timeout}s; still pending: '
                            f'{", ".join(str(r) for r in pending)}', err=True)
             _render_wait(ctx, run_ids, finished, output)
-            raise SystemExit(2)
+            raise SystemExit(EXIT_TIMEOUT)
         if not quiet:
             click.echo(f'waiting on {", ".join(str(r) for r in pending)} '
                        f'({interval}s)', err=True)
@@ -834,5 +839,7 @@ def _render_wait(ctx: click.Context, run_ids: Tuple[int, ...],
     :type output: str
     """
     rows = [finished[run_id] for run_id in dict.fromkeys(run_ids) if run_id in finished]
-    payload: Any = rows[0] if len(rows) == 1 else {'data': rows}
-    render(payload, output, ctx.obj.get('color', False))
+    # Always a collection, even for one run. The shape must not depend on how
+    # many ids the caller passed, or `sp run wait $IDS | jq '.data[]'` works
+    # until the list happens to contain a single run.
+    render({'data': rows, 'total': len(rows)}, output, ctx.obj.get('color', False))

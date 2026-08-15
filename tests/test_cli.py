@@ -7,6 +7,7 @@ from unittest import mock
 from click.testing import CliRunner
 
 from sp_cli.client import ApiError
+from sp_cli.constants import EXIT_TIMEOUT
 from sp_cli.main import cli
 from tests import SESSION_SANDBOX  # noqa: F401
 
@@ -1621,14 +1622,51 @@ class RunWaitTests(unittest.TestCase):
     @mock.patch('sp_cli.commands.run.time.monotonic')
     @mock.patch('sp_cli.client.ApiClient.get')
     def test_wait_times_out(self, mock_get, mock_clock):
-        """Passing the deadline exits 2 and reports what was still pending."""
+        """Passing the deadline exits 9 and reports what was still pending."""
         mock_get.return_value = {'run_id': 9476, 'status': 'queued'}
         # Start, then a reading past the deadline on the first check.
         mock_clock.side_effect = [0, 10_000, 10_000]
         result = self.runner.invoke(cli, ['run', 'wait', '9476', '--timeout', '60'])
 
-        self.assertEqual(result.exit_code, 2)
+        self.assertEqual(result.exit_code, EXIT_TIMEOUT)
         self.assertIn('timed out', result.stderr)
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_a_timeout_is_distinguishable_from_a_usage_error(self, mock_get):
+        """The reason the timeout code is not 2.
+
+        Click exits 2 on any usage error. Sharing that code would make a
+        mistyped flag indistinguishable from "the runs are still going", so a
+        script branching on it would sleep and retry a command that never ran.
+        """
+        for argv in (['run', 'wait'],                          # no run ids
+                     ['run', 'wait', '--nosuchflag'],          # unknown option
+                     ['run', 'wait', '9476', '--interval', '1']):   # below the minimum
+            result = self.runner.invoke(cli, argv)
+            self.assertEqual(result.exit_code, 2, argv)
+            self.assertNotEqual(result.exit_code, EXIT_TIMEOUT, argv)
+        mock_get.assert_not_called()
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_one_run_is_rendered_as_a_collection_like_every_other_list(self, mock_get):
+        """The payload shape must not depend on how many ids were passed.
+
+        Returning a bare record for a single run breaks
+        `sp run wait $IDS | jq '.data[]'` exactly when the list happens to hold
+        one run -- the same command, working or not by coincidence.
+        """
+        mock_get.return_value = {'run_id': 9476, 'status': 'pass'}
+        single = json.loads(self.runner.invoke(cli, ['run', 'wait', '9476']).stdout)
+
+        mock_get.side_effect = [{'run_id': 9476, 'status': 'pass'},
+                                {'run_id': 9477, 'status': 'pass'}]
+        several = json.loads(
+            self.runner.invoke(cli, ['run', 'wait', '9476', '9477']).stdout)
+
+        self.assertEqual(single['total'], 1)
+        self.assertEqual(several['total'], 2)
+        for payload in (single, several):
+            self.assertIsInstance(payload['data'], list)
 
     @mock.patch('sp_cli.client.ApiClient.get')
     def test_wait_surfaces_api_errors(self, mock_get):

@@ -1,3 +1,4 @@
+
 """Enumerations accepted by the platform API, mirrored so the CLI can reject bad input locally.
 
 Each tuple matches a validator in the merged ``mod_api`` blueprint. Keeping them
@@ -28,6 +29,14 @@ RUN_PENDING_STATUSES = ('queued', 'running')
 #: Terminal statuses that mean the run itself did not succeed. ``sp run wait``
 #: exits non-zero on these so a script can gate on it.
 RUN_UNSUCCESSFUL_STATUSES = ('fail', 'canceled', 'error')
+
+#: ``sp run wait`` exits with this when the deadline passes before every run
+#: finishes. Deliberately **not** 2: Click exits 2 on any usage error -- an
+#: unknown flag, a missing argument, an out-of-range ``--interval`` -- so a
+#: script branching on 2 would read a typo as "still running" and retry a
+#: command that never executed. 1 through 8 are taken by ``ApiError.exit_code``
+#: and Click, so the first free code is 9.
+EXIT_TIMEOUT = 9
 
 #: ``sp run wait`` polling bounds, in seconds.
 WAIT_INTERVAL_DEFAULT = 30
