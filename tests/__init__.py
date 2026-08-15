@@ -36,4 +36,11 @@ os.environ['XDG_CONFIG_HOME'] = os.path.join(SESSION_SANDBOX, 'config')
 os.environ['HOME'] = os.path.join(SESSION_SANDBOX, 'home')
 os.makedirs(os.environ['HOME'], exist_ok=True)
 
+# The CLI reads these through click's envvar= (see main.py), so a developer with
+# either exported -- which is exactly what the README suggests for day-to-day use
+# -- changes what the tests observe. SP_BASE_URL made a precedence test fail; a
+# real SP_API_TOKEN would quietly become test input. Drop both.
+for _leaking in ('SP_BASE_URL', 'SP_API_TOKEN'):
+    os.environ.pop(_leaking, None)
+
 atexit.register(shutil.rmtree, SESSION_SANDBOX, True)
