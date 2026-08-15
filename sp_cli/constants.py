@@ -1,4 +1,3 @@
-
 """Enumerations accepted by the platform API, mirrored so the CLI can reject bad input locally.
 
 Each tuple matches a validator in the merged ``mod_api`` blueprint. Keeping them
@@ -37,6 +36,14 @@ RUN_UNSUCCESSFUL_STATUSES = ('fail', 'canceled', 'error')
 #: command that never executed. 1 through 8 are taken by ``ApiError.exit_code``
 #: and Click, so the first free code is 9.
 EXIT_TIMEOUT = 9
+
+#: ``sp run wait`` exits with this when the wait itself could not be completed:
+#: an API failure that has no more specific code of its own (a 500, a malformed
+#: response). Distinct from 1, which this command spends on "a run you waited
+#: for failed" -- a merge gate has to tell a bad branch from a platform hiccup,
+#: because the first should block and the second should be retried. Errors that
+#: do map to a code of their own (3 through 8) keep it.
+EXIT_WAIT_ABORTED = 10
 
 #: ``sp run wait`` polling bounds, in seconds.
 WAIT_INTERVAL_DEFAULT = 30

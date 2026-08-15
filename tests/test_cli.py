@@ -7,7 +7,7 @@ from unittest import mock
 from click.testing import CliRunner
 
 from sp_cli.client import ApiError
-from sp_cli.constants import EXIT_TIMEOUT
+from sp_cli.constants import EXIT_TIMEOUT, EXIT_WAIT_ABORTED
 from sp_cli.main import cli
 from tests import SESSION_SANDBOX  # noqa: F401
 
@@ -1675,3 +1675,31 @@ class RunWaitTests(unittest.TestCase):
         result = self.runner.invoke(cli, ['run', 'wait', '9476'])
 
         self.assertNotEqual(result.exit_code, 0)
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_a_broken_wait_is_distinguishable_from_a_failed_run(self, mock_get):
+        """1 means a run failed, never that the wait itself broke.
+
+        A merge gate blocks on 1. If an API failure with no code of its own also
+        exited 1, a 500 from the platform would read as "this branch is bad" and
+        block a branch nothing is wrong with -- and retrying, the right response
+        to a 500, is the one thing the script would not do.
+        """
+        mock_get.side_effect = ApiError('server_error', 'boom', status=500)
+        broke = self.runner.invoke(cli, ['run', 'wait', '9476'])
+
+        mock_get.side_effect = None
+        mock_get.return_value = {'run_id': 9476, 'status': 'fail'}
+        failed = self.runner.invoke(cli, ['run', 'wait', '9476'])
+
+        self.assertEqual(broke.exit_code, EXIT_WAIT_ABORTED)
+        self.assertEqual(failed.exit_code, 1)
+        self.assertNotEqual(broke.exit_code, failed.exit_code)
+
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_api_errors_that_map_to_a_code_keep_it(self, mock_get):
+        """Only the codeless errors are remapped; 3-8 still mean what they mean."""
+        for status, expected in ((404, 4), (401, 6), (429, 7), (409, 8)):
+            mock_get.side_effect = ApiError('err', 'nope', status=status)
+            result = self.runner.invoke(cli, ['run', 'wait', '9476'])
+            self.assertEqual(result.exit_code, expected, f'HTTP {status}')

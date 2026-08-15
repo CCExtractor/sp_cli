@@ -277,12 +277,26 @@ Scripts and agents can branch on the exit status:
 | 7 | rate limited |
 | 8 | conflict (e.g. deleting a test that has results) |
 | 9 | `run wait` gave up before every run finished |
+| 10 | `run wait` could not finish waiting (API error with no code of its own) |
 
-`run wait` additionally exits 1 when a run it waited for failed or was
-canceled. Note what is *not* in this table: **2**, which Click returns for any
-usage error — an unknown flag, a missing argument, an out-of-range value. Never
-give 2 a meaning of your own, or a mistyped flag becomes indistinguishable from
-a real outcome.
+Under `run wait`, **1 means a run you waited for failed or was canceled** — a
+verdict about the code, and the only exit code that is one. Everything that
+went wrong with the wait itself lands on 3–8 or 10. The distinction is what
+lets a merge gate block on a bad branch and retry on a bad afternoon:
+
+```bash
+sp run wait $ID
+case $? in
+  0)     merge ;;
+  1)     block ;;      # the branch is bad
+  9|10)  retry ;;      # the platform is; nothing was learned about the branch
+esac
+```
+
+Note what is *not* in this table: **2**, which Click returns for any usage
+error — an unknown flag, a missing argument, an out-of-range value. Never give
+2 a meaning of your own, or a mistyped flag becomes indistinguishable from a
+real outcome.
 
 ## Development
 

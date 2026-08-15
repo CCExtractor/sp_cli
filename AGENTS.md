@@ -69,7 +69,8 @@ sp run artifacts <run>                # binary, coredump, stdout, outputs
 sp queue                              # what is running right now
 sp run progress <run>                 # live status of one run
 sp run wait <run> [<run> ...]         # block until they finish; 0 all passed,
-                                      # 1 something failed, 9 timed out
+                                      # 1 a run failed, 9 timed out,
+                                      # 10 the wait itself broke
 sp run ls --pr <n>                    # every run for one pull request
 sp run ls --created-after 2026-08-09T00:00:00Z   # recent activity
 ```
@@ -133,9 +134,13 @@ sp run ls --limit 5   | jq -r '.data[]     | "\(.run_id) \(.platform) \(.status)
 ```
 
 Exit codes to branch on: `0` ok, `3` unreachable, `4` not found, `5` validation,
-`6` auth, `7` rate limited, `8` conflict, `9` `run wait` timed out. **`2` means
-you got the command wrong** — an unknown flag, a missing argument, a value out
-of range — so treat it as a bug in your invocation, never as an outcome.
+`6` auth, `7` rate limited, `8` conflict, `9` `run wait` timed out, `10` `run
+wait` broke before it could finish. Under `run wait`, `1` means a run failed or
+was canceled and nothing else does, so `1` is a verdict about the code while
+`9`/`10` say only that the platform misbehaved — block on the first, retry the
+others. **`2` means you got the command wrong** — an unknown flag, a missing
+argument, a value out of range — so treat it as a bug in your invocation, never
+as an outcome.
 
 Progress spinners, retry notices, and colour go to **stderr** and are suppressed
 when stdout is not a terminal, so JSON on stdout is always parseable.

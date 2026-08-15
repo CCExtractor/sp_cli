@@ -12,10 +12,11 @@ from sp_cli.compare import compare_runs, coverage_warnings
 from sp_cli.constants import (ARTIFACT_TYPES, CANCEL_REASON_MIN_LENGTH,
                               COMMIT_SHA_LENGTH, ERROR_GROUP_BY,
                               ERROR_SEVERITIES, ERROR_TYPES, EXIT_TIMEOUT,
-                              INFRA_ERROR_TYPES, LOG_CONTAINS_MAX_LENGTH,
-                              LOG_LEVELS, LOG_SOURCES, MAX_OFFSET,
-                              MAX_PAGE_LIMIT, MAX_REGRESSION_TEST_IDS,
-                              PLATFORMS, PR_SCAN_DEFAULT, PR_SCAN_MAX,
+                              EXIT_WAIT_ABORTED, INFRA_ERROR_TYPES,
+                              LOG_CONTAINS_MAX_LENGTH, LOG_LEVELS, LOG_SOURCES,
+                              MAX_OFFSET, MAX_PAGE_LIMIT,
+                              MAX_REGRESSION_TEST_IDS, PLATFORMS,
+                              PR_SCAN_DEFAULT, PR_SCAN_MAX,
                               RUN_PENDING_STATUSES, RUN_STATUSES,
                               RUN_UNSUCCESSFUL_STATUSES, SAMPLE_STATUSES,
                               WAIT_INTERVAL_DEFAULT, WAIT_INTERVAL_MAX,
@@ -778,7 +779,9 @@ def run_wait(ctx: click.Context, run_ids: Tuple[int, ...], interval: int,
 
     Exits 0 only if every run finished successfully; a failed or canceled run
     exits 1 and a timeout exits 9, which lets a script gate on the result
-    without parsing the output.
+    without parsing the output. If the wait itself cannot be completed the exit
+    code describes that instead: 3 through 8 for an API error that maps to one,
+    10 for anything else. Nothing but a run's own verdict exits 1.
 
     A run whose status is `pass` exits 0 even if it recorded results for only a
     fraction of its samples, because the API derives that status from the rows
@@ -797,7 +800,12 @@ def run_wait(ctx: click.Context, run_ids: Tuple[int, ...], interval: int,
                 record = client.get(f'/runs/{run_id}')
             except ApiError as error:
                 render_error(error, output)
-                raise SystemExit(error.exit_code)
+                # An error with no code of its own exits 1 everywhere else, but
+                # this command has already given 1 a meaning: a run you waited
+                # for failed. Collapsing both into 1 tells a merge gate to block
+                # the branch when the platform merely returned a 500.
+                code = error.exit_code
+                raise SystemExit(EXIT_WAIT_ABORTED if code == 1 else code)
             status = record.get('status')
             if status not in RUN_PENDING_STATUSES:
                 finished[run_id] = record
