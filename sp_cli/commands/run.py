@@ -31,6 +31,18 @@ from sp_cli.triage import classify_sample, is_failure
 #: regressions first, missing evidence before good news.
 COMPARE_BUCKETS = ('new', 'changed', 'still_failing', 'not_rerun', 'fixed', 'no_baseline')
 
+#: How a failure's standing against one reference reads in a table. Short
+#: enough to keep a column narrow, and worded so a reader does not have to
+#: remember which bucket name means what.
+_STANDING_LABELS = {
+    'new': 'NEW HERE',
+    'changed': 'differs',
+    'still_failing': 'fails there too',
+    'fixed': 'fixed here',
+    'not_rerun': 'not rerun',
+    'no_baseline': 'never ran there',
+}
+
 #: Run fields identifying each side of a comparison.
 _COMPARE_RUN_FIELDS = ('run_id', 'platform', 'commit_sha', 'branch', 'pr_number', 'status')
 
@@ -189,6 +201,14 @@ def run_report(ctx: click.Context, run_id: int, against: Tuple[int, ...],
             'against': 'the approved output',
             'tests_with_results': len(run_samples),
             'failing': len(failing),
+            # Named, not just counted: "69 failed" is not something a reviewer
+            # can act on, and the whole point of the references below is to say
+            # something about each one of them.
+            # classify_sample supplies the code; the raw sample rows carry the
+            # ingredients for it (exit codes, output states) but not the verdict.
+            'failures': [{'regression_test_id': row.get('regression_test_id'),
+                          'sample_name': row.get('sample_name'),
+                          'code': classify_sample(row).get('code')} for row in failing],
         },
         'references': [],
     }
@@ -209,12 +229,31 @@ def run_report(ctx: click.Context, run_id: int, against: Tuple[int, ...],
             'new': result['new'],
             'fixed': result['fixed'],
             'warnings': coverage_warnings(run_detail, reference['run'], result),
+            'standing': _standing_by_test(result),
         })
 
     if output == 'json':
         render(report, output, ctx.obj.get('color', False))
         return
     _print_report(report, ctx.obj.get('color', False))
+
+
+def _standing_by_test(result: Dict[str, Any]) -> Dict[int, str]:
+    """
+    Map each regression test to how it stood against one reference.
+
+    :param result: A ``compare_runs`` result.
+    :type result: Dict[str, Any]
+    :return: Regression test id mapped to its bucket name.
+    :rtype: Dict[int, str]
+    """
+    standing: Dict[int, str] = {}
+    for bucket in ('new', 'changed', 'still_failing', 'fixed', 'not_rerun', 'no_baseline'):
+        for row in result.get(bucket, []):
+            test_id = row.get('regression_test_id')
+            if test_id is not None:
+                standing[test_id] = bucket
+    return standing
 
 
 def _print_report(report: Dict[str, Any], color: bool) -> None:
@@ -248,18 +287,25 @@ def _print_report(report: Dict[str, Any], color: bool) -> None:
                    f"still_failing {counts['still_failing']}   fixed {counts['fixed']}{tail}")
         for warning in reference['warnings']:
             click.echo(f"      note: {warning}", err=True)
-        if reference['new']:
-            # The counts are the answer; the list is evidence for it. A hundred
-            # rows under each reference buries the line the reader came for, so
-            # show enough to recognise the pattern and say what was held back.
-            shown = reference['new'][:REPORT_LIST_LIMIT]
-            render({'data': [{'regression_test_id': row.get('regression_test_id'),
-                              'sample_name': row.get('sample_name'),
-                              'code': row.get('code')} for row in shown]},
-                   'table', color)
-            held_back = len(reference['new']) - len(shown)
-            if held_back:
-                click.echo(f"      ... and {held_back} more (all of them in --output json)")
+
+    failures = report['verdict']['failures']
+    if failures:
+        click.echo(f"\n  the {len(failures)} that do not match, and how each stands:")
+        shown = failures[:REPORT_LIST_LIMIT]
+        rows = []
+        for failure in shown:
+            row = {'test': failure['regression_test_id'],
+                   'sample': failure['sample_name'],
+                   'code': failure['code']}
+            for reference in report['references']:
+                column = f"vs {reference['run']['run_id']}"
+                row[column] = _STANDING_LABELS.get(
+                    reference['standing'].get(failure['regression_test_id']), 'no result')
+            rows.append(row)
+        render({'data': rows}, 'table', color)
+        held_back = len(failures) - len(shown)
+        if held_back:
+            click.echo(f"      ... and {held_back} more (all of them in --output json)")
 
     nearest = report['references'][-1]
     if nearest['counts']['new']:

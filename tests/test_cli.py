@@ -1675,6 +1675,53 @@ class RunReportTests(unittest.TestCase):
         self.assertIn('and 24 more', table)
         self.assertEqual(len(payload['references'][0]['new']), 39)
 
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_every_failing_test_is_named_with_its_standing(self, mock_get, mock_pages):
+        """A count is not actionable: say which tests, and how each one stands.
+
+        One row per failure with a column per reference is the whole answer --
+        the reader can see at a glance which failures are theirs and which the
+        reference already had.
+        """
+        mock_get.return_value = self.run
+        reference_run = {**self.run, 'run_id': 9484, 'branch': 'master',
+                         'created_at': '2026-08-14T10:00:00Z'}
+        mock_pages.side_effect = [
+            [self.sample(1, 'fail'), self.sample(2, 'fail'), self.sample(3, 'pass')],
+            [reference_run],
+            [self.sample(1, 'pass'), self.sample(2, 'fail'), self.sample(3, 'pass')],
+        ]
+
+        payload = json.loads(self.runner.invoke(cli, ['run', 'report', '9492']).stdout)
+        named = {f['regression_test_id']: f for f in payload['verdict']['failures']}
+        standing = payload['references'][0]['standing']
+
+        self.assertEqual(sorted(named), [1, 2])
+        self.assertTrue(all(f['code'] for f in payload['verdict']['failures']))
+        self.assertEqual(standing['1'], 'new')
+        self.assertEqual(standing['2'], 'still_failing')
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_table_names_the_failures_and_their_standing(self, mock_get, mock_pages):
+        """The table a human reads must carry the same answer as the JSON."""
+        mock_get.return_value = self.run
+        reference_run = {**self.run, 'run_id': 9484, 'branch': 'master',
+                         'created_at': '2026-08-14T10:00:00Z'}
+        mock_pages.side_effect = [
+            [self.sample(1, 'fail'), self.sample(2, 'fail')],
+            [reference_run],
+            [self.sample(1, 'pass'), self.sample(2, 'fail')],
+        ]
+
+        table = self.runner.invoke(cli, ['-o', 'table', 'run', 'report', '9492']).stdout
+
+        self.assertIn('sample1', table)
+        self.assertIn('sample2', table)
+        self.assertIn('NEW HERE', table)
+        self.assertIn('fails there too', table)
+
 
 class RunWaitTests(unittest.TestCase):
     """Exercise `sp run wait`, with sleeping and the clock stubbed out."""
