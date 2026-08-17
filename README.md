@@ -108,6 +108,7 @@ request), `--retries N`, `--no-color`, and `--version`.
 ```bash
 sp investigate <run_id>              # one-shot triage: info + counts + classified failures
 sp run compare <run_id> <baseline>   # which of these failures are new?
+sp run report <run_id>               # ... same question, references resolved for you
 sp investigate <run_id> --with-history   # ... and whether each failure is new
 sp run summary <run_id>              # pass/fail summary for a run
 sp run failures <run_id>             # failing tests, each auto-classified

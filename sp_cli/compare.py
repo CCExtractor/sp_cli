@@ -155,3 +155,61 @@ def coverage_warnings(run: Dict[str, Any], baseline: Dict[str, Any],
             f"{result['counts']['not_rerun']} baseline failure(s) produced no result here; "
             'they are reported as not_rerun rather than fixed.')
     return warnings
+
+
+def pick_references(run: Dict[str, Any],
+                    branch_runs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Choose which earlier runs a run is worth being described against.
+
+    Two references answer different questions. The newest run on the target
+    branch says whether a failure is broken where everyone else is working. The
+    newest one that predates this run is the closest thing to where the branch
+    was cut from, which is what separates "this change did it" from "it was
+    already like that".
+
+    This is a *proxy* for ancestry, not ancestry: the API exposes no commit
+    graph, so a run that predates this one is assumed to precede it in history.
+    That holds for a branch cut from the target and stops holding for one cut
+    weeks ago and rebased since. The label says "before this run" rather than
+    "ancestor" so a reader is not told more than was checked.
+
+    :param run: The run being reported on.
+    :type run: Dict[str, Any]
+    :param branch_runs: Candidate runs on the target branch, newest first.
+    :type branch_runs: List[Dict[str, Any]]
+    :return: References as {label, run}, nearest question first, deduplicated.
+    :rtype: List[Dict[str, Any]]
+    """
+    usable = []
+    for candidate in branch_runs:
+        if candidate.get('run_id') == run.get('run_id'):
+            continue
+        if candidate.get('platform') != run.get('platform'):
+            continue
+        # A run that never reached a verdict has nothing to say about this one.
+        if candidate.get('status') not in ('pass', 'fail'):
+            continue
+        usable.append(candidate)
+    if not usable:
+        return []
+
+    created = run.get('created_at') or ''
+    earlier = []
+    if created:
+        for candidate in usable:
+            if (candidate.get('created_at') or '') < created:
+                earlier.append(candidate)
+
+    chosen: List[Tuple[str, Dict[str, Any]]] = [('the newest run on the target branch', usable[0])]
+    if earlier:
+        chosen.append(('the newest run before this one', earlier[0]))
+
+    references: List[Dict[str, Any]] = []
+    seen: Set[int] = set()
+    for label, candidate in chosen:
+        if candidate['run_id'] in seen:
+            continue
+        seen.add(candidate['run_id'])
+        references.append({'label': label, 'run': candidate})
+    return references

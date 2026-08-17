@@ -1566,6 +1566,163 @@ class BaseUrlPrecedenceTests(unittest.TestCase):
             'https://sampleplatform.ccextractor.org/api/v1')
 
 
+class RunReportTests(unittest.TestCase):
+    """`sp run report` describes a run against the approved output and earlier runs."""
+
+    def setUp(self):
+        """Build a runner and the payloads every case is assembled from."""
+        self.runner = CliRunner()
+        self.run = {'run_id': 9492, 'platform': 'linux', 'commit_sha': 'a' * 40,
+                    'branch': 'pull_request', 'pr_number': 2325, 'status': 'fail',
+                    'created_at': '2026-08-15T10:00:00Z'}
+
+    @staticmethod
+    def sample(test_id, status, code='OUTPUT_DIFF'):
+        """
+        Build one per-sample result row.
+
+        :param test_id: Regression test id.
+        :type test_id: int
+        :param status: pass or fail.
+        :type status: str
+        :param code: Failure classification.
+        :type code: str
+        :return: A row shaped like /runs/{id}/samples returns.
+        :rtype: Dict[str, Any]
+        """
+        return {'regression_test_id': test_id, 'sample_name': f'sample{test_id}',
+                'status': status, 'code': code, 'exit_code': 0, 'expected_rc': 0}
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_a_failure_present_in_the_reference_is_not_reported_as_new(self, mock_get, mock_pages):
+        """The whole point: a failure the reference shares is not this change's.
+
+        This is what the platform used to get wrong -- it reported 70 tests as
+        broken by a branch that had not touched them.
+        """
+        mock_get.return_value = self.run
+        failing = [self.sample(i, 'fail') for i in range(1, 6)]
+        reference_run = {**self.run, 'run_id': 9484, 'branch': 'master',
+                         'created_at': '2026-08-14T10:00:00Z'}
+        mock_pages.side_effect = [failing, [reference_run], failing]
+
+        result = self.runner.invoke(cli, ['run', 'report', '9492'])
+        payload = json.loads(result.stdout)
+
+        self.assertEqual(payload['verdict']['failing'], 5)
+        self.assertEqual(payload['references'][0]['counts']['new'], 0)
+        self.assertEqual(payload['references'][0]['counts']['still_failing'], 5)
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_a_failure_the_reference_passed_is_reported_as_new(self, mock_get, mock_pages):
+        """The complement: what the reference passed and this run failed is the finding."""
+        mock_get.return_value = self.run
+        reference_run = {**self.run, 'run_id': 9484, 'branch': 'master',
+                         'created_at': '2026-08-14T10:00:00Z'}
+        mock_pages.side_effect = [[self.sample(1, 'fail')], [reference_run],
+                                  [self.sample(1, 'pass')]]
+
+        payload = json.loads(self.runner.invoke(cli, ['run', 'report', '9492']).stdout)
+
+        self.assertEqual(payload['references'][0]['counts']['new'], 1)
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_no_reference_run_is_reported_rather_than_implied_to_be_clean(self, mock_get, mock_pages):
+        """Having nothing to compare against must not read as good news."""
+        mock_get.return_value = self.run
+        mock_pages.side_effect = [[self.sample(1, 'fail')], []]
+
+        result = self.runner.invoke(cli, ['run', 'report', '9492'])
+        payload = json.loads(result.stdout)
+
+        self.assertEqual(payload['references'], [])
+        self.assertEqual(payload['verdict']['failing'], 1)
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_explicit_baselines_are_used_instead_of_resolution(self, mock_get, mock_pages):
+        """--against names the comparison rather than guessing at it."""
+        named = {**self.run, 'run_id': 9478, 'branch': 'master'}
+        mock_get.side_effect = [self.run, named]
+        mock_pages.side_effect = [[self.sample(1, 'fail')], [self.sample(1, 'fail')]]
+
+        payload = json.loads(
+            self.runner.invoke(cli, ['run', 'report', '9492', '--against', '9478']).stdout)
+
+        self.assertEqual(len(payload['references']), 1)
+        self.assertEqual(payload['references'][0]['run']['run_id'], 9478)
+        self.assertEqual(payload['references'][0]['label'], 'the run you named')
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_table_output_is_capped_but_json_is_complete(self, mock_get, mock_pages):
+        """Truncation is for reading; a script must still get everything."""
+        mock_get.return_value = self.run
+        many = [self.sample(i, 'fail') for i in range(1, 40)]
+        reference_run = {**self.run, 'run_id': 9484, 'branch': 'master',
+                         'created_at': '2026-08-14T10:00:00Z'}
+        passing = [self.sample(i, 'pass') for i in range(1, 40)]
+
+        mock_pages.side_effect = [many, [reference_run], passing]
+        table = self.runner.invoke(cli, ['-o', 'table', 'run', 'report', '9492']).stdout
+
+        mock_pages.side_effect = [many, [reference_run], passing]
+        payload = json.loads(self.runner.invoke(cli, ['run', 'report', '9492']).stdout)
+
+        self.assertIn('and 24 more', table)
+        self.assertEqual(len(payload['references'][0]['new']), 39)
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_every_failing_test_is_named_with_its_standing(self, mock_get, mock_pages):
+        """A count is not actionable: say which tests, and how each one stands.
+
+        One row per failure with a column per reference is the whole answer --
+        the reader can see at a glance which failures are theirs and which the
+        reference already had.
+        """
+        mock_get.return_value = self.run
+        reference_run = {**self.run, 'run_id': 9484, 'branch': 'master',
+                         'created_at': '2026-08-14T10:00:00Z'}
+        mock_pages.side_effect = [
+            [self.sample(1, 'fail'), self.sample(2, 'fail'), self.sample(3, 'pass')],
+            [reference_run],
+            [self.sample(1, 'pass'), self.sample(2, 'fail'), self.sample(3, 'pass')],
+        ]
+
+        payload = json.loads(self.runner.invoke(cli, ['run', 'report', '9492']).stdout)
+        named = {f['regression_test_id']: f for f in payload['verdict']['failures']}
+        standing = payload['references'][0]['standing']
+
+        self.assertEqual(sorted(named), [1, 2])
+        self.assertTrue(all(f['code'] for f in payload['verdict']['failures']))
+        self.assertEqual(standing['1'], 'new')
+        self.assertEqual(standing['2'], 'still_failing')
+
+    @mock.patch('sp_cli.client.ApiClient.get_paginated')
+    @mock.patch('sp_cli.client.ApiClient.get')
+    def test_table_names_the_failures_and_their_standing(self, mock_get, mock_pages):
+        """The table a human reads must carry the same answer as the JSON."""
+        mock_get.return_value = self.run
+        reference_run = {**self.run, 'run_id': 9484, 'branch': 'master',
+                         'created_at': '2026-08-14T10:00:00Z'}
+        mock_pages.side_effect = [
+            [self.sample(1, 'fail'), self.sample(2, 'fail')],
+            [reference_run],
+            [self.sample(1, 'pass'), self.sample(2, 'fail')],
+        ]
+
+        table = self.runner.invoke(cli, ['-o', 'table', 'run', 'report', '9492']).stdout
+
+        self.assertIn('sample1', table)
+        self.assertIn('sample2', table)
+        self.assertIn('NEW HERE', table)
+        self.assertIn('fails there too', table)
+
+
 class RunWaitTests(unittest.TestCase):
     """Exercise `sp run wait`, with sleeping and the clock stubbed out."""
 

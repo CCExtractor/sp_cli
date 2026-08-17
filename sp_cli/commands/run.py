@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import click
 
 from sp_cli.client import ApiError
-from sp_cli.compare import compare_runs, coverage_warnings
+from sp_cli.compare import compare_runs, coverage_warnings, pick_references
 from sp_cli.constants import (ARTIFACT_TYPES, CANCEL_REASON_MIN_LENGTH,
                               COMMIT_SHA_LENGTH, ERROR_GROUP_BY,
                               ERROR_SEVERITIES, ERROR_TYPES, EXIT_TIMEOUT,
@@ -16,7 +16,7 @@ from sp_cli.constants import (ARTIFACT_TYPES, CANCEL_REASON_MIN_LENGTH,
                               LOG_CONTAINS_MAX_LENGTH, LOG_LEVELS, LOG_SOURCES,
                               MAX_OFFSET, MAX_PAGE_LIMIT,
                               MAX_REGRESSION_TEST_IDS, PLATFORMS,
-                              PR_SCAN_DEFAULT, PR_SCAN_MAX,
+                              PR_SCAN_DEFAULT, PR_SCAN_MAX, REPORT_LIST_LIMIT,
                               RUN_PENDING_STATUSES, RUN_STATUSES,
                               RUN_UNSUCCESSFUL_STATUSES, SAMPLE_STATUSES,
                               WAIT_INTERVAL_DEFAULT, WAIT_INTERVAL_MAX,
@@ -30,6 +30,18 @@ from sp_cli.triage import classify_sample, is_failure
 #: Buckets `run compare` sorts failures into, in the order worth reading them:
 #: regressions first, missing evidence before good news.
 COMPARE_BUCKETS = ('new', 'changed', 'still_failing', 'not_rerun', 'fixed', 'no_baseline')
+
+#: How a failure's standing against one reference reads in a table. Short
+#: enough to keep a column narrow, and worded so a reader does not have to
+#: remember which bucket name means what.
+_STANDING_LABELS = {
+    'new': 'NEW HERE',
+    'changed': 'differs',
+    'still_failing': 'fails there too',
+    'fixed': 'fixed here',
+    'not_rerun': 'not rerun',
+    'no_baseline': 'never ran there',
+}
 
 #: Run fields identifying each side of a comparison.
 _COMPARE_RUN_FIELDS = ('run_id', 'platform', 'commit_sha', 'branch', 'pr_number', 'status')
@@ -132,6 +144,178 @@ def _list_runs_for_pr(ctx: click.Context, params: Dict[str, Any],
     render({'data': matches, 'total': len(matches),
             'scanned': len(scanned), 'scan_truncated': truncated},
            output, ctx.obj.get('color', False))
+
+
+@run.command('report')
+@click.argument('run_id', type=int)
+@click.option('--against', 'against', type=int, multiple=True,
+              help='Compare against these runs instead of resolving them (repeatable).')
+@click.option('--branch', default='master', show_default=True,
+              help='Branch whose runs are used as references.')
+@click.option('--scan', type=click.IntRange(1, MAX_PAGE_LIMIT), default=25, show_default=True,
+              help='How many recent branch runs to consider when resolving references.')
+@click.pass_context
+def run_report(ctx: click.Context, run_id: int, against: Tuple[int, ...],
+               branch: str, scan: int) -> None:
+    """Describe a run's failures against the approved output and against earlier runs.
+
+    Pass and fail answer one question: did the output match the approved file.
+    Who made that true is a different question, and it is the one a reviewer
+    needs -- a test that has failed for a month says nothing about the change in
+    front of them.
+
+    So the verdict is reported as-is, and every failure is then described
+    against earlier runs: the newest on the target branch, and the newest that
+    predates this run. A failure present in both is not this change's doing; one
+    that is new relative to the run before it is where to start reading.
+
+    The second reference is a proxy for "where this branch was cut from", not
+    ancestry -- the API exposes no commit graph, so ordering by time is the best
+    available. Pass --against explicitly when you know the right baseline.
+    """
+    client = ctx.obj['client']
+    output = ctx.obj['output']
+    try:
+        with Spinner(f'Building report for run {run_id}', output != 'json'):
+            run_detail = client.get(f'/runs/{run_id}')
+            run_samples = client.get_paginated(f'/runs/{run_id}/samples')
+            if against:
+                candidates = [client.get(f'/runs/{baseline_id}') for baseline_id in against]
+            else:
+                candidates = client.get_paginated(
+                    '/runs', params={'branch': branch, 'platform': run_detail.get('platform')},
+                    max_items=scan)
+    except ApiError as error:
+        render_error(error, output)
+        raise SystemExit(error.exit_code)
+
+    if against:
+        references = [{'label': 'the run you named', 'run': candidate} for candidate in candidates]
+    else:
+        references = pick_references(run_detail, candidates)
+
+    failing = [row for row in run_samples if is_failure(row)]
+    report: Dict[str, Any] = {
+        'run': {field: run_detail.get(field) for field in _COMPARE_RUN_FIELDS},
+        'verdict': {
+            'against': 'the approved output',
+            'tests_with_results': len(run_samples),
+            'failing': len(failing),
+            # Named, not just counted: "69 failed" is not something a reviewer
+            # can act on, and the whole point of the references below is to say
+            # something about each one of them.
+            # classify_sample supplies the code; the raw sample rows carry the
+            # ingredients for it (exit codes, output states) but not the verdict.
+            'failures': [{'regression_test_id': row.get('regression_test_id'),
+                          'sample_name': row.get('sample_name'),
+                          'code': classify_sample(row).get('code')} for row in failing],
+        },
+        'references': [],
+    }
+
+    for reference in references:
+        try:
+            with Spinner(f"Comparing against run {reference['run']['run_id']}", output != 'json'):
+                baseline_samples = client.get_paginated(
+                    f"/runs/{reference['run']['run_id']}/samples")
+        except ApiError as error:
+            render_error(error, output)
+            raise SystemExit(error.exit_code)
+        result = compare_runs(run_samples, baseline_samples)
+        report['references'].append({
+            'label': reference['label'],
+            'run': {field: reference['run'].get(field) for field in _COMPARE_RUN_FIELDS},
+            'counts': result['counts'],
+            'new': result['new'],
+            'fixed': result['fixed'],
+            'warnings': coverage_warnings(run_detail, reference['run'], result),
+            'standing': _standing_by_test(result),
+        })
+
+    if output == 'json':
+        render(report, output, ctx.obj.get('color', False))
+        return
+    _print_report(report, ctx.obj.get('color', False))
+
+
+def _standing_by_test(result: Dict[str, Any]) -> Dict[int, str]:
+    """
+    Map each regression test to how it stood against one reference.
+
+    :param result: A ``compare_runs`` result.
+    :type result: Dict[str, Any]
+    :return: Regression test id mapped to its bucket name.
+    :rtype: Dict[int, str]
+    """
+    standing: Dict[int, str] = {}
+    for bucket in ('new', 'changed', 'still_failing', 'fixed', 'not_rerun', 'no_baseline'):
+        for row in result.get(bucket, []):
+            test_id = row.get('regression_test_id')
+            if test_id is not None:
+                standing[test_id] = bucket
+    return standing
+
+
+def _print_report(report: Dict[str, Any], color: bool) -> None:
+    """
+    Print a report as something a person reads top to bottom.
+
+    :param report: The payload built by ``run report``.
+    :type report: Dict[str, Any]
+    :param color: Whether colour was requested.
+    :type color: bool
+    """
+    run_info = report['run']
+    verdict = report['verdict']
+    click.echo(f"run {run_info['run_id']}  {run_info['platform']}  "
+               f"{(run_info.get('commit_sha') or '')[:8]}  status={run_info.get('status')}")
+    click.echo(f"  {verdict['failing']} of {verdict['tests_with_results']} tests "
+               f"do not match {verdict['against']}")
+
+    if not report['references']:
+        click.echo('\n  No earlier run to compare against, so nothing here says '
+                   'whether this change caused them.')
+        return
+
+    for reference in report['references']:
+        counts = reference['counts']
+        reference_run = reference['run']
+        click.echo(f"\n  vs {reference['label']} — run {reference_run['run_id']} "
+                   f"({(reference_run.get('commit_sha') or '')[:8]})")
+        tail = f"   not_rerun {counts['not_rerun']}" if counts['not_rerun'] else ''
+        click.echo(f"      new {counts['new']}   changed {counts['changed']}   "
+                   f"still_failing {counts['still_failing']}   fixed {counts['fixed']}{tail}")
+        for warning in reference['warnings']:
+            click.echo(f"      note: {warning}", err=True)
+
+    failures = report['verdict']['failures']
+    if failures:
+        click.echo(f"\n  the {len(failures)} that do not match, and how each stands:")
+        shown = failures[:REPORT_LIST_LIMIT]
+        rows = []
+        for failure in shown:
+            row = {'test': failure['regression_test_id'],
+                   'sample': failure['sample_name'],
+                   'code': failure['code']}
+            for reference in report['references']:
+                column = f"vs {reference['run']['run_id']}"
+                row[column] = _STANDING_LABELS.get(
+                    reference['standing'].get(failure['regression_test_id']), 'no result')
+            rows.append(row)
+        render({'data': rows}, 'table', color)
+        held_back = len(failures) - len(shown)
+        if held_back:
+            click.echo(f"      ... and {held_back} more (all of them in --output json)")
+
+    nearest = report['references'][-1]
+    if nearest['counts']['new']:
+        click.echo(f"\n  {nearest['counts']['new']} of {verdict['failing']} failures are new "
+                   f"relative to {nearest['label']}. Those are this change's.")
+    elif verdict['failing']:
+        click.echo(f"\n  None of the {verdict['failing']} failures are new relative to "
+                   f"{nearest['label']}; they fail there too.")
+    else:
+        click.echo('\n  Everything matched the approved output.')
 
 
 @run.command('create')
