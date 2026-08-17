@@ -45,6 +45,11 @@ EXIT_TIMEOUT = 9
 #: do map to a code of their own (3 through 8) keep it.
 EXIT_WAIT_ABORTED = 10
 
+#: How many failing tests ``sp run report`` lists per reference in table mode.
+#: The counts are the answer and the rows are evidence for it; JSON output is
+#: never truncated, so nothing is lost to a script.
+REPORT_LIST_LIMIT = 15
+
 #: ``sp run wait`` polling bounds, in seconds.
 WAIT_INTERVAL_DEFAULT = 30
 WAIT_INTERVAL_MIN = 5

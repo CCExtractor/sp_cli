@@ -59,6 +59,8 @@ Then drill in:
 
 ```bash
 sp run compare <run> <baseline>       # which failures are new vs the baseline
+sp run report <run>                   # verdict + the same diff against resolved
+                                      # references; the "is this mine?" answer
 sp run summary <run>                  # counts only, cheapest
 sp run error-summary <run>            # grouped error counts, server-derived
 sp run result <run> <regression_test_id>   # one test: exit code, command, outputs
